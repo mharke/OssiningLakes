@@ -1,0 +1,1087 @@
+---
+title: "Ossining Lakes Microbial Community Analysis (2023)"
+author: "[Your Name(s)]"
+date: "`r format(Sys.Date(), '%m/%d/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+    fig_width: 8
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = TRUE,
+  message = TRUE,
+  fig.align = "center",
+  fig.path = "figs/"
+)
+```
+
+# Overview
+
+**[Manuscript title here]**
+
+[Author list and journal citation here]
+
+## Summary
+
+Analysis of 16S (prokaryote) and 18S (eukaryote) amplicon sequence variant (ASV)
+data from three Ossining-area lakes — Lake Mohegan (LM), Lake Rippowam (LR), and
+Teatown Lake (TTL) — sampled from June to September 2023. Environmental metadata
+(nutrients, temperature, pH, dissolved oxygen, microcystin) were measured at each
+sampling event.
+
+This document contains code for:
+
+- Data loading, transformation, and filtering of 16S and 18S ASV count tables
+- Weighted Gene Co-expression Network Analysis (WGCNA) to identify modules of co-occurring ASVs
+- Module–trait (environmental parameter) correlation analysis
+- Intramodular connectivity and hub taxa identification
+- Inter-domain (16S vs 18S) correlation analysis within WGCNA modules
+- Network visualization of inter-domain associations
+- Core taxa–environment time series plotting
+
+## Contents
+
+All input files are available in the `data/` directory of the
+[GitHub repository](https://github.com/YOUR-USERNAME/ossining-lakes-2023).
+Raw sequences are publicly available under
+[BioProject PRJNA_XXXXXXX](https://www.ncbi.nlm.nih.gov/bioproject/PRJNA_XXXXXXX).
+
+# Set up working R environment
+
+The following analysis was performed in **R version `r getRversion()`**.
+
+```{r load-libraries, message=FALSE, warning=FALSE}
+# --- Core WGCNA and ecology packages ---
+library(WGCNA)
+library(vegan)
+library(RColorBrewer)
+
+# --- Tidyverse for data wrangling and plotting ---
+library(tidyverse)    # includes ggplot2, dplyr, readr, tidyr, stringr, purrr
+library(lubridate)
+
+# --- Network visualization ---
+library(igraph)
+library(ggraph)
+
+# --- Plot layout ---
+library(patchwork)
+
+# Enable multithreading for WGCNA
+enableWGCNAThreads()
+```
+
+```{r utility-functions}
+# Null-coalescing operator (used by explore_module_trait)
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
+
+# Create output directory for WGCNA results
+dir.create("results/wgcna", recursive = TRUE, showWarnings = FALSE)
+```
+
+# WGCNA Analysis
+
+## Data loading, transformation, and filtering
+
+We read the combined ASV count + taxonomy Table SX files for 16S and 18S. The
+`process_counts_from_table_sx()` function separates count columns from taxonomy
+columns, prefixes ASV IDs with the domain tag to avoid collisions, applies a
+Hellinger transformation, and filters low-abundance ASVs.
+
+```{r define-processing-function}
+# Function to read combined count+taxonomy Table SX files.
+# Separates count columns from taxonomy columns, prefixes ASV IDs with the
+# domain tag (e.g., "16S_") to avoid ID collisions when 16S and 18S are merged,
+# and strips the domain prefix from sample column names so that samples align
+# across domains and with the trait data.
+#
+# Parameters:
+#   file_path   : path to a Table SX CSV (ASV IDs in col 1, counts, then taxonomy)
+#   domain_tag  : character prefix for the domain, e.g. "16S" or "18S"
+#   taxa_cols   : character vector of taxonomy column names to exclude from counts
+#   filter_mean : Hellinger-transformed row-mean threshold for ASV retention
+process_counts_from_table_sx <- function(file_path,
+                                         domain_tag,
+                                         taxa_cols,
+                                         filter_mean = 0.05) {
+  
+  # Read file; first column (unnamed) contains ASV IDs -> row names
+  raw <- read.csv(file = file_path, header = TRUE, row.names = 1,
+                  check.names = FALSE)
+  
+  # Separate count columns from taxonomy columns
+  count_cols <- setdiff(colnames(raw), taxa_cols)
+  counts <- raw[, count_cols, drop = FALSE]
+  
+  # Strip domain prefix from sample names (e.g., "16S-LM-6-1" -> "LM-6-1")
+  colnames(counts) <- sub(paste0("^", domain_tag, "-"), "", colnames(counts))
+  
+  # Prefix ASV IDs with domain tag to ensure uniqueness after rbind
+  rownames(counts) <- paste0(domain_tag, "_", rownames(counts))
+  
+  # Hellinger transformation (vegan::decostand)
+  counts_H <- decostand(counts, method = "hellinger")
+  
+  # Filter low-abundance ASVs based on row mean of transformed values
+  rowmean <- apply(counts_H, 1, mean)
+  to_include <- rowmean >= filter_mean
+  
+  message(sprintf("[%s] ASVs kept: %d / %d", domain_tag,
+                  sum(to_include), nrow(counts_H)))
+  
+  return(counts_H[to_include, ])
+}
+```
+
+```{r load-and-filter-counts}
+# Define taxonomy column names for each domain
+taxa_cols_16s <- c("Kingdom", "Phylum", "Class", "Order",
+                   "Family", "Genus", "Species", "Taxa")
+taxa_cols_18s <- c("Domain", "Supergroup", "Division", "Subdivision",
+                   "Class", "Order", "Family", "Genus", "Species", "Taxa")
+
+# Process counts from the Table SX files
+counts_filt16s <- process_counts_from_table_sx(
+  file_path  = "data/Table_SX_16S_2023_ASV_Count_and_Taxonomy.csv",
+  domain_tag = "16S",
+  taxa_cols  = taxa_cols_16s
+)
+counts_filt18s <- process_counts_from_table_sx(
+  file_path  = "data/Table_SX_18S_2023_ASV_Count_and_Taxonomy.csv",
+  domain_tag = "18S",
+  taxa_cols  = taxa_cols_18s
+)
+
+# Merge 16S and 18S (ASVs as rows, samples as columns), then transpose
+# for WGCNA (samples as rows, ASVs as columns)
+counts <- rbind(counts_filt16s, counts_filt18s)
+tcounts <- as.data.frame(t(counts))
+
+# Check for excessive missing data or low-variance genes
+gsg <- goodSamplesGenes(tcounts, verbose = 3)
+if (!gsg$allOK) {
+  warning("Some samples or genes flagged by goodSamplesGenes. Review gsg$goodSamples and gsg$goodGenes.")
+  tcounts <- tcounts[gsg$goodSamples, gsg$goodGenes]
+}
+```
+
+## Environmental trait data preparation
+
+Environmental metadata (nutrients, temperature, pH, dissolved oxygen, microcystin)
+are matched to the sample order in the transposed count matrix.
+
+```{r prepare-trait-data}
+# Read trait (environmental) data
+traitData <- read.csv("data/Ossining_Lake_Metadata_2023.csv", header = TRUE)
+
+# The Site column uses underscores (e.g., "LR_6_1") but the Table SX sample
+# names use hyphens (e.g., "LR-6-1"). Convert to match.
+traitData$Site <- gsub("_", "-", traitData$Site)
+
+# Match trait rows to sample order in tcounts
+OTUSamples <- rownames(tcounts)
+traitRows <- match(OTUSamples, traitData$Site)
+
+# Verify all samples matched
+if (any(is.na(traitRows))) {
+  warning(paste("Unmatched samples:",
+                paste(OTUSamples[is.na(traitRows)], collapse = ", ")))
+}
+
+# Drop both Site (col 1) AND SampleID (col 2) — only keep numeric traits
+datTraits <- traitData[traitRows, -c(1, 2)]
+rownames(datTraits) <- traitData[traitRows, 1]
+
+# Report any missing data in trait columns
+na_counts <- colSums(is.na(datTraits))
+if (any(na_counts > 0)) {
+  message("WARNING: Missing data detected in trait columns:")
+  print(na_counts[na_counts > 0])
+  message("Pairwise-complete correlations will have reduced N for these traits.")
+}
+
+collectGarbage()
+```
+
+## Sample clustering and outlier detection
+
+Hierarchical clustering of samples to check for outliers prior to network
+construction.
+
+```{r sample-clustering, fig.width=12, fig.height=9}
+# Sample clustering dendrogram
+sampleTree <- hclust(dist(tcounts), method = "average")
+par(cex = 0.6, mar = c(0, 4, 2, 0))
+plot(sampleTree, main = "Sample clustering to detect outliers",
+     sub = "", xlab = "", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+```
+
+```{r dendro-trait-heatmap, fig.width=12, fig.height=9}
+# Visualize traits alongside sample dendrogram
+sampleTree2 <- hclust(dist(tcounts), method = "average")
+traitColors <- numbers2colors(datTraits, signed = FALSE)
+plotDendroAndColors(sampleTree2, traitColors,
+                    groupLabels = names(datTraits),
+                    main = "Sample dendrogram and trait heatmap")
+```
+
+## Soft threshold selection
+
+Pick the soft-thresholding power for a signed network. We look for the lowest
+power where scale-free topology fit (R²) exceeds 0.70.
+
+```{r pick-soft-threshold, fig.width=12, fig.height=5}
+## Figure S2
+powers <- c(1:10, seq(from = 12, to = 20, by = 2))
+sft <- pickSoftThreshold(tcounts, powerVector = powers, verbose = 5,
+                         networkType = "signed")
+
+# Plot scale-free topology fit and mean connectivity
+par(mfrow = c(1, 2), mar = c(5, 5, 3, 1))
+cex1 <- 0.9
+
+# Scale independence plot
+plot(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft Threshold (power)",
+     ylab = "Scale Free Topology Model Fit, signed R^2",
+     type = "n", main = "Scale independence")
+text(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     labels = powers, cex = cex1, col = "red")
+abline(h = 0.70, col = "red")
+
+# Mean connectivity plot
+plot(sft$fitIndices[, 1], sft$fitIndices[, 5],
+     xlab = "Soft Threshold (power)",
+     ylab = "Mean Connectivity",
+     type = "n", main = "Mean connectivity")
+text(sft$fitIndices[, 1], sft$fitIndices[, 5],
+     labels = powers, cex = cex1, col = "red")
+```
+
+## Network construction and module detection
+
+Construct a signed co-expression network using `blockwiseModules` and detect
+modules of co-occurring ASVs.
+
+```{r construct-network}
+# Set soft threshold power
+# NOTE: softPower=12 is carried forward from the original analysis.
+# Verify that R^2 >= 0.70 at this power before proceeding.
+softPower <- 12
+
+# Check R^2 at chosen power
+sft_row <- which(sft$fitIndices[, 1] == softPower)
+if (length(sft_row) == 1) {
+  sft_r2 <- -sign(sft$fitIndices[sft_row, 3]) * sft$fitIndices[sft_row, 2]
+  message(sprintf("Scale-free fit R^2 at power %d: %.3f", softPower, sft_r2))
+  if (sft_r2 < 0.70) {
+    warning(sprintf(
+      "R^2 = %.3f at power %d is below the 0.70 threshold. Consider a different power.",
+      sft_r2, softPower))
+  }
+}
+
+# Construct network and detect modules
+net <- blockwiseModules(tcounts,
+                        power = softPower,
+                        networkType = "signed",
+                        TOMType = "signed",
+                        minModuleSize = 30,
+                        reassignThreshold = 0,
+                        mergeCutHeight = 0.25,
+                        numericLabels = TRUE,
+                        pamRespectsDendro = FALSE,
+                        verbose = 3)
+
+moduleColors <- labels2colors(net$colors)
+MEs_raw <- net$MEs  # preserve original MEs before reordering
+
+# Print module sizes for reference
+message("Module sizes (after merging):")
+print(table(moduleColors))
+```
+
+## Module eigengene dendrogram
+
+```{r me-dendrogram, fig.width=10, fig.height=6}
+## Figure S11
+moduleTree <- hclust(dist(1 - cor(MEs_raw)), method = "average")
+
+# Map ME labels to WGCNA colors for the dendrogram
+me_numeric_labels <- as.numeric(sub("^ME", "", colnames(MEs_raw)))
+me_colors <- labels2colors(me_numeric_labels)
+moduleTree$labels <- paste0(colnames(MEs_raw), " (", me_colors, ")")
+
+plotDendroAndColors(moduleTree,
+                    colors = me_colors,
+                    groupLabels = "Module color",
+                    dendroLabels = moduleTree$labels,
+                    main = "Clustering of module eigengenes",
+                    cex.dendroLabels = 1.0,
+                    cex.colorLabels = 0.8)
+```
+
+# Module–Trait Correlation
+
+Correlate module eigengenes with all measured environmental traits (nutrients,
+temperature, pH, dissolved oxygen, microcystin).
+
+```{r module-trait-heatmap, fig.width=10, fig.height=10}
+## Figure 8
+nTaxa <- ncol(tcounts)
+nSamples <- nrow(tcounts)
+
+# Recalculate ordered module eigengenes for the heatmap
+MEs0 <- moduleEigengenes(tcounts, moduleColors)$eigengenes
+MEs <- orderMEs(MEs0)
+
+# Compute correlations and p-values between MEs and all numeric traits
+moduleTraitCor <- cor(MEs, datTraits, use = "p")
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nSamples)
+
+# Plot labeled heatmap
+textMatrix <- paste(signif(moduleTraitCor, 2), "\n(",
+                    signif(moduleTraitPvalue, 1), ")", sep = "")
+dim(textMatrix) <- dim(moduleTraitCor)
+
+par(mar = c(6, 8.5, 3, 3))
+labeledHeatmap(Matrix = moduleTraitCor,
+               xLabels = names(datTraits),
+               yLabels = names(MEs),
+               ySymbols = names(MEs),
+               colorLabels = FALSE,
+               colors = blueWhiteRed(50),
+               textMatrix = textMatrix,
+               setStdMargins = FALSE,
+               cex.text = 0.8,
+               zlim = c(-1, 1),
+               main = "Module-trait relationships")
+```
+
+# Intramodular Connectivity and Hub Taxa
+
+Identify hub ASVs (highly connected nodes within each module).
+
+```{r hub-taxa}
+# Calculate adjacency matrix (same parameters as blockwiseModules)
+adjacency <- adjacency(tcounts, power = softPower, type = "signed")
+
+# Calculate intramodular connectivity
+kIN <- intramodularConnectivity(adjacency, moduleColors)
+
+# Combine connectivity with ASV and module information
+ASV_Info <- data.frame(
+  ASV = names(tcounts),
+  Module_Color = moduleColors,
+  kIN_Within = kIN$kWithin
+)
+
+# Identify hub taxa in key modules
+# NOTE: Replace these with the modules of interest from section 4 results
+key_modules <- c("blue", "pink")
+
+hub_taxa_list <- ASV_Info %>%
+  filter(Module_Color %in% key_modules) %>%
+  group_by(Module_Color) %>%
+  arrange(desc(kIN_Within))
+
+top_10_hubs <- hub_taxa_list %>%
+  slice_head(n = 10) %>%
+  as.data.frame()
+
+print("Top 10 Hub Taxa (ASVs) in Key Modules:")
+print(top_10_hubs)
+
+write.csv(ASV_Info, "results/wgcna/ASV_Intramodular_Connectivity.csv",
+          row.names = FALSE)
+```
+
+# Taxonomy Lookup and Module Membership
+
+## Build taxonomy lookup table
+
+```{r taxonomy-lookup}
+# Helper: extract taxonomy columns from a Table SX file
+extract_taxa_from_table_sx <- function(file_path, domain_tag, taxa_cols) {
+  raw <- read.csv(file = file_path, header = TRUE, row.names = 1,
+                  check.names = FALSE)
+  taxa_df <- raw[, intersect(colnames(raw), taxa_cols), drop = FALSE]
+  taxa_df$ASV_ID <- paste0(domain_tag, "_", rownames(taxa_df))
+  return(taxa_df)
+}
+
+taxa_16s_raw <- extract_taxa_from_table_sx(
+  "data/Table_SX_16S_2023_ASV_Count_and_Taxonomy.csv", "16S", taxa_cols_16s)
+taxa_18s_raw <- extract_taxa_from_table_sx(
+  "data/Table_SX_18S_2023_ASV_Count_and_Taxonomy.csv", "18S", taxa_cols_18s)
+
+# Standardize: rename "Taxa" -> "Taxa2", keep shared columns
+standardize_taxa <- function(df) {
+  colnames(df)[colnames(df) == "Taxa"] <- "Taxa2"
+  keep_cols <- intersect(colnames(df),
+                         c("ASV_ID", "Class", "Order", "Family",
+                           "Genus", "Species", "Taxa2"))
+  return(df[, keep_cols, drop = FALSE])
+}
+
+taxa_16s_std <- standardize_taxa(taxa_16s_raw)
+taxa_18s_std <- standardize_taxa(taxa_18s_raw)
+
+ASV_taxa <- rbind(taxa_16s_std, taxa_18s_std)
+rownames(ASV_taxa) <- ASV_taxa$ASV_ID
+```
+
+## Module Membership (MM)
+
+Module membership quantifies how strongly each ASV correlates with its module
+eigengene.
+
+```{r module-membership}
+modNames <- substring(names(MEs), 3)
+
+TaxaModuleMembership <- as.data.frame(cor(tcounts, MEs, use = "p"))
+MMPvalue <- as.data.frame(corPvalueStudent(as.matrix(TaxaModuleMembership),
+                                           nSamples))
+names(TaxaModuleMembership) <- paste0("MM", modNames)
+names(MMPvalue) <- paste0("p.MM", modNames)
+```
+
+# Module–Trait Exploration
+
+## Define exploration function
+
+The `explore_module_trait()` function computes Gene Significance (GS) for a
+given trait, pairs it with Module Membership (MM), annotates with taxonomy, and
+produces a scatter plot.
+
+```{r define-explore-function}
+explore_module_trait <- function(module_color,
+                                 trait_column_name,
+                                 datTraits_data,
+                                 tcounts_data,
+                                 moduleColors_data,
+                                 ASV_taxa_data,
+                                 alpha = 0.05,
+                                 highlight_taxa = NULL,
+                                 highlight_name = NULL) {
+  
+  # Compute nSamples locally
+  n_samples <- nrow(tcounts_data)
+  
+  # 1. Prepare trait vector
+  trait_data <- as.data.frame(datTraits_data[[trait_column_name]])
+  names(trait_data) <- trait_column_name
+  
+  # 2. Calculate Gene Significance (GS) for this trait
+  TaxaTraitSignificance <- as.data.frame(cor(tcounts_data, trait_data, use = "p"))
+  GSPvalue <- as.data.frame(corPvalueStudent(as.matrix(TaxaTraitSignificance),
+                                             n_samples))
+  names(TaxaTraitSignificance) <- paste0("GS.", trait_column_name)
+  names(GSPvalue) <- paste0("p.GS.", trait_column_name)
+  
+  # 3. Find the MM column for this module
+  column <- match(module_color, modNames)
+  if (is.na(column)) stop(paste("Module color", module_color, "not found in modNames."))
+  
+  # 4. Assemble data frame with MM, GS, and taxonomy
+  taxa_module_trait_data <- data.frame(
+    ASV_ID = rownames(TaxaModuleMembership),
+    Module_Color = moduleColors_data,
+    MM = TaxaModuleMembership[, column],
+    p.MM = MMPvalue[, column],
+    GS = TaxaTraitSignificance[, 1],
+    p.GS = GSPvalue[, 1],
+    stringsAsFactors = FALSE
+  )
+  
+  final_taxa_table <- merge(taxa_module_trait_data, ASV_taxa_data,
+                            by = "ASV_ID", all.x = TRUE)
+  
+  # Subset to the target module
+  module_output <- final_taxa_table[final_taxa_table$Module_Color == module_color, ]
+  
+  # Sort by |GS| then |MM| descending
+  module_output <- module_output[order(abs(module_output$GS),
+                                       abs(module_output$MM),
+                                       decreasing = TRUE), ]
+  
+  # Add trait name column for downstream merging
+  module_output$Trait <- trait_column_name
+  
+  # 5. Determine point colors for plot
+  is_sig <- module_output$p.MM < alpha & module_output$p.GS < alpha
+  point_colors <- rep("gray70", nrow(module_output))
+  
+  if (!is.null(highlight_taxa)) {
+    # Highlight a specific taxon
+    is_highlight <- is_sig & (module_output$Taxa2 == highlight_taxa)
+    point_colors[is_highlight] <- module_color
+    
+    legend_data <- list(
+      labels = c(paste(highlight_name %||% highlight_taxa, "(p <", alpha, ")"),
+                 "Other Taxa"),
+      colors = c(module_color, "gray70")
+    )
+    title_text <- paste(highlight_name %||% highlight_taxa, "significance")
+    
+  } else {
+    # Color all significant points by Taxa2
+    taxa_vec <- module_output$Taxa2
+    sig_categories <- unique(taxa_vec[is_sig])
+    n_cat <- length(sig_categories)
+    
+    if (n_cat > 0) {
+      get_colors <- colorRampPalette(brewer.pal(max(n_cat, 3), "Set1"))
+      taxa_colors <- setNames(get_colors(n_cat), sig_categories)
+      point_colors[is_sig] <- taxa_colors[taxa_vec[is_sig]]
+    } else {
+      taxa_colors <- c()
+    }
+    
+    legend_data <- list(labels = names(taxa_colors), colors = taxa_colors)
+    title_text <- "Taxa membership by taxonomic group"
+  }
+  
+  # 6. Export results
+  output_filename <- paste0("Taxa_Data_", module_color,
+                            "_Module_vs_", trait_column_name, "_with_Taxa.csv")
+  write.csv(module_output,
+            file = file.path("results/wgcna", output_filename),
+            row.names = FALSE)
+  
+  # 7. Plot MM vs GS scatter
+  par(mfrow = c(1, 1))
+  verboseScatterplot(
+    abs(module_output$MM),
+    abs(module_output$GS),
+    xlab = paste("Module Membership in", module_color, "module (|MM|)"),
+    ylab = paste("Taxa significance for", trait_column_name, "(|GS|)"),
+    main = paste("MM vs. GS in", module_color, "module:", title_text),
+    cex.main = 1.2, cex.lab = 1.2, cex.axis = 1.2,
+    col = point_colors,
+    pch = 16,
+    cex = ifelse(is_sig, 1.2, 0.8)
+  )
+  
+  if (length(legend_data$labels) > 0 && !is.null(legend_data$labels[1])) {
+    legend("topleft",
+           legend = legend_data$labels,
+           col = legend_data$colors,
+           pch = 16, bty = "n", cex = 0.8)
+  }
+}
+```
+
+## Apply to specific module–trait combinations
+
+> **NOTE:** Only 2 module–trait combinations are shown here as examples. Add
+> additional calls to `explore_module_trait()` as needed for your full analysis.
+
+```{r explore-black-bdo, fig.width=8, fig.height=8}
+explore_module_trait(
+  module_color     = "black",
+  trait_column_name = "Bdo",
+  datTraits_data   = datTraits,
+  tcounts_data     = tcounts,
+  moduleColors_data = moduleColors,
+  ASV_taxa_data    = ASV_taxa
+)
+```
+
+```{r explore-brown-stemp, fig.width=8, fig.height=8}
+explore_module_trait(
+  module_color     = "brown",
+  trait_column_name = "stemp",
+  datTraits_data   = datTraits,
+  tcounts_data     = tcounts,
+  moduleColors_data = moduleColors,
+  ASV_taxa_data    = ASV_taxa
+)
+```
+
+# Merge Module–Trait Results
+
+Combine all per-module-trait CSV outputs into a single summary table.
+
+```{r merge-module-trait-results}
+output_dir <- "results/wgcna/"
+file_pattern <- "^Taxa_Data_.*_with_Taxa\\.csv$"
+
+all_files <- list.files(path = output_dir, pattern = file_pattern,
+                        full.names = TRUE)
+
+if (length(all_files) == 0) {
+  stop("No module-trait CSV files found in 'results/wgcna/'. Ensure section 8 ran successfully.")
+}
+
+# Use bind_rows to handle potential column mismatches from stale files
+data_list <- lapply(all_files, read.csv, stringsAsFactors = FALSE)
+combined_trait_data <- bind_rows(data_list)
+
+write.csv(combined_trait_data,
+          file = paste0(output_dir, "Combined_All_Module_Trait_Results.csv"),
+          row.names = FALSE)
+
+message(sprintf("Merged %d files into Combined_All_Module_Trait_Results.csv (%d rows).",
+                length(all_files), nrow(combined_trait_data)))
+```
+
+# Export Module Assignments
+
+```{r export-module-assignments}
+# Module assignments
+asv_module_table <- data.frame(
+  ASV = colnames(tcounts),
+  Module_Color = moduleColors,
+  stringsAsFactors = FALSE
+)
+asv_module_table <- asv_module_table[order(asv_module_table$Module_Color), ]
+write.csv(asv_module_table, file = "results/wgcna/asv_module_assignments.csv",
+          row.names = FALSE)
+
+# Module assignments merged with sample-level Hellinger-transformed counts
+tcounts_transposed <- as.data.frame(t(tcounts))
+asv_module_samples <- merge(asv_module_table, tcounts_transposed,
+                            by.x = "ASV", by.y = "row.names")
+asv_module_samples <- asv_module_samples[, c("ASV", "Module_Color",
+                                             setdiff(names(asv_module_samples),
+                                                     c("ASV", "Module_Color")))]
+write.csv(asv_module_samples,
+          file = "results/wgcna/asv_module_and_sample_data.csv",
+          row.names = FALSE)
+```
+
+# Inter-Domain (16S vs 18S) Correlation Analysis
+
+Calculate cross-domain correlations within each WGCNA module to identify
+significant prokaryote–eukaryote associations.
+
+```{r interdomain-correlations}
+# --- Determine ASV domain membership ---
+get_asv_type <- function(asv_id, counts_16s_df, counts_18s_df) {
+  if (asv_id %in% rownames(counts_16s_df)) return("16S")
+  if (asv_id %in% rownames(counts_18s_df)) return("18S")
+  return("Unknown")
+}
+
+asv_ids_in_wgcna <- colnames(tcounts)
+asv_domains <- sapply(asv_ids_in_wgcna, function(id) {
+  get_asv_type(id, counts_filt16s, counts_filt18s)
+})
+asv_domain_df <- data.frame(ASV_ID = asv_ids_in_wgcna,
+                            Domain = asv_domains,
+                            row.names = NULL,
+                            stringsAsFactors = FALSE)
+
+# --- Inter-domain correlation function ---
+run_all_interdomain_correlations <- function(tcounts_data,
+                                             net_colors_data,
+                                             asv_domain_data,
+                                             TaxaModuleMembership,
+                                             MMPvalue,
+                                             ASV_taxa_data,
+                                             alpha = 0.05) {
+  
+  unique_module_labels <- unique(net_colors_data)
+  unique_module_labels <- unique_module_labels[unique_module_labels != 0]
+  all_sig_cors <- list()
+  nSamples_local <- nrow(tcounts_data)
+  
+  all_color_map <- labels2colors(unique_module_labels)
+  names(all_color_map) <- unique_module_labels
+  
+  for (module_label in unique_module_labels) {
+    
+    module_color <- all_color_map[as.character(module_label)]
+    if (is.null(module_color) || is.na(module_color)) next
+    
+    message(sprintf("Processing module %s (color: %s)", module_label, module_color))
+    
+    # Isolate ASVs in this module
+    module_ASVs <- names(net_colors_data[net_colors_data == module_label])
+    
+    # Split by domain
+    module_domains <- asv_domain_data[asv_domain_data$ASV_ID %in% module_ASVs, ]
+    asv_16s <- module_domains$ASV_ID[module_domains$Domain == "16S"]
+    asv_18s <- module_domains$ASV_ID[module_domains$Domain == "18S"]
+    
+    if (length(asv_16s) == 0 || length(asv_18s) == 0) {
+      message(sprintf("  Skipping %s: 16S=%d, 18S=%d", module_color,
+                      length(asv_16s), length(asv_18s)))
+      next
+    }
+    
+    # Calculate cross-domain correlation matrix
+    data_16s <- tcounts_data[, asv_16s, drop = FALSE]
+    data_18s <- tcounts_data[, asv_18s, drop = FALSE]
+    
+    cor_matrix <- cor(data_16s, data_18s, use = "pairwise.complete.obs")
+    pval_matrix <- corPvalueStudent(cor_matrix, nSamples_local)
+    
+    # Convert to long format
+    cor_df <- data.frame(
+      ASV_16S = rep(rownames(cor_matrix), times = ncol(cor_matrix)),
+      ASV_18S = rep(colnames(cor_matrix), each = nrow(cor_matrix)),
+      Module_Color = module_color,
+      Correlation_16S_18S = as.vector(cor_matrix),
+      P_value_16S_18S = as.vector(pval_matrix),
+      stringsAsFactors = FALSE
+    )
+    
+    # Filter to significant correlations
+    sig_df <- cor_df[cor_df$P_value_16S_18S < alpha, ]
+    message(sprintf("  Found %d significant pairs (p < %g)", nrow(sig_df), alpha))
+    
+    if (nrow(sig_df) > 0) {
+      sig_df$ASV_16S <- as.character(sig_df$ASV_16S)
+      sig_df$ASV_18S <- as.character(sig_df$ASV_18S)
+      
+      # Add module membership values
+      mm_col <- paste0("MM", module_label)
+      pmm_col <- paste0("p.MM", module_label)
+      
+      sig_df$MM_16S   <- TaxaModuleMembership[match(sig_df$ASV_16S, rownames(TaxaModuleMembership)), mm_col]
+      sig_df$p.MM_16S <- MMPvalue[match(sig_df$ASV_16S, rownames(MMPvalue)), pmm_col]
+      sig_df$MM_18S   <- TaxaModuleMembership[match(sig_df$ASV_18S, rownames(TaxaModuleMembership)), mm_col]
+      sig_df$p.MM_18S <- MMPvalue[match(sig_df$ASV_18S, rownames(MMPvalue)), pmm_col]
+      
+      # Add taxonomy info
+      taxa_16s <- ASV_taxa_data[match(sig_df$ASV_16S, ASV_taxa_data$ASV_ID),
+                                c("Taxa2", "ASV_ID")]
+      taxa_18s <- ASV_taxa_data[match(sig_df$ASV_18S, ASV_taxa_data$ASV_ID),
+                                c("Taxa2", "ASV_ID")]
+      colnames(taxa_16s) <- paste0("16S_", colnames(taxa_16s))
+      colnames(taxa_18s) <- paste0("18S_", colnames(taxa_18s))
+      
+      sig_df <- cbind(sig_df, taxa_16s, taxa_18s)
+      all_sig_cors[[module_color]] <- sig_df
+    }
+  }
+  
+  # Combine all modules
+  final_table <- do.call(rbind, all_sig_cors)
+  if (is.null(final_table)) {
+    message("No significant inter-domain correlations found.")
+    return(NULL)
+  }
+  
+  # Sort by module then by correlation strength
+  final_table <- final_table[order(final_table$Module_Color,
+                                   -abs(final_table$Correlation_16S_18S)), ]
+  
+  write.csv(final_table,
+            file = "results/wgcna/All_InterDomain_Correlations_Combined.csv",
+            row.names = FALSE)
+  message(sprintf("Inter-domain analysis complete: %d significant pairs saved.",
+                  nrow(final_table)))
+  
+  return(final_table)
+}
+
+# Run the inter-domain analysis
+all_interdomain_cors <- run_all_interdomain_correlations(
+  tcounts_data = tcounts,
+  net_colors_data = net$colors,
+  asv_domain_data = asv_domain_df,
+  TaxaModuleMembership = TaxaModuleMembership,
+  MMPvalue = MMPvalue,
+  ASV_taxa_data = ASV_taxa,
+  alpha = 0.05
+)
+```
+
+## Filter inter-domain correlations (stricter thresholds)
+
+Apply more stringent cutoffs (p < 0.01, |r| > 0.4) for downstream network
+visualization.
+
+```{r filter-interdomain}
+input_file  <- "results/wgcna/All_InterDomain_Correlations_Combined.csv"
+output_file <- "results/wgcna/Filtered_InterDomain_Correlations_R.csv"
+
+data_df <- read_csv(input_file, show_col_types = FALSE)
+
+# Apply stricter thresholds
+filtered_df <- data_df %>%
+  filter(P_value_16S_18S < 0.01,
+         abs(Correlation_16S_18S) > 0.4)
+
+message(sprintf("Inter-domain filtering: %d -> %d correlations (p<0.01, |r|>0.4)",
+                nrow(data_df), nrow(filtered_df)))
+
+write_csv(filtered_df, output_file)
+```
+
+# Module–Trait–Taxa Summary and Bubble Chart
+
+Identify the most abundant taxon per module–trait combination and visualize
+using a bubble chart.
+
+```{r bubble-chart, fig.width=10, fig.height=8}
+## Figure 9
+original_data <- read_csv("results/wgcna/Combined_All_Module_Trait_Results.csv",
+                          show_col_types = FALSE)
+
+# Find the most frequent Taxa2 per module-trait combination
+# and compute its average Gene Significance
+top_taxa_gs_summary <- original_data %>%
+  group_by(Module_Color, Trait, Taxa2) %>%
+  summarise(Count = n(), Avg_GS = mean(GS), .groups = "drop_last") %>%
+  mutate(Total_Count = sum(Count)) %>%
+  arrange(desc(Count)) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  mutate(Proportion = Count / Total_Count) %>%
+  select(Module_Color, Trait, Top_Taxa2 = Taxa2,
+         Count, Total_Count, Proportion, Avg_GS)
+
+write_csv(top_taxa_gs_summary, "Top_Taxa_Per_Module_Trait_with_GS.csv")
+
+# Prepare plot data
+data_for_plot <- top_taxa_gs_summary %>%
+  mutate(
+    Correlation_Direction = case_when(
+      Avg_GS > 0  ~ "Positive",
+      Avg_GS < 0  ~ "Negative",
+      TRUE         ~ "Neutral"
+    ),
+    Correlation_Strength = abs(Avg_GS)
+  )
+
+# Bubble chart
+p_enhanced <- data_for_plot %>%
+  mutate(Top_Taxa2 = factor(Top_Taxa2)) %>%
+  ggplot(aes(x = Trait, y = Module_Color)) +
+  geom_point(aes(fill = Top_Taxa2,
+                 size = Correlation_Strength,
+                 color = Correlation_Direction),
+             shape = 21, stroke = 1.5, alpha = 0.8) +
+  scale_size_continuous(name = "|Average GS| (Strength)", range = c(2, 15)) +
+  scale_color_manual(name = "Avg. GS Direction",
+                     values = c("Positive" = "darkred",
+                                "Negative" = "darkblue",
+                                "Neutral" = "gray")) +
+  labs(title = "Top Taxa within Each Module-Trait Combination",
+       subtitle = "Size = |Avg. GS|, Border = GS direction, Fill = Top taxon",
+       x = "Trait", y = "Module Color") +
+  theme_bw(base_size = 16) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+        plot.subtitle = element_text(hjust = 0.5, size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 13),
+        panel.grid.minor = element_blank(),
+        legend.box = "vertical")
+
+print(p_enhanced)
+```
+
+# Inter-Domain Network Visualization
+
+Visualize the filtered inter-domain correlations as a network graph, with
+separate plots per WGCNA module.
+
+```{r network-plots, fig.width=8, fig.height=8, results='asis'}
+# Load filtered inter-domain correlations
+df <- read_csv("results/wgcna/Filtered_InterDomain_Correlations_R.csv",
+               show_col_types = FALSE)
+
+# Define stricter thresholds for network visualization
+P_cutoff <- 0.001
+R_cutoff <- 0.7
+
+# Filter to keep only strong and significant edges
+full_filtered_df <- df %>%
+  filter(
+    P_value_16S_18S < P_cutoff,
+    abs(Correlation_16S_18S) >= R_cutoff
+  ) %>%
+  select(ASV_18S, ASV_16S, Module_Color, Correlation_16S_18S,
+         P_value_16S_18S, `18S_Taxa2`, `16S_Taxa2`) %>%
+  rename(
+    from = ASV_18S,
+    to = ASV_16S,
+    weight = Correlation_16S_18S
+  )
+
+cat(sprintf("Total edges after filtering: %d\n\n", nrow(full_filtered_df)))
+
+# Build full node list
+nodes_18S <- full_filtered_df %>% 
+  select(name = from, Taxa = `18S_Taxa2`, Module_Color) %>% 
+  mutate(Domain = "Eukaryote (18S)", Label = name)
+
+nodes_16S <- full_filtered_df %>% 
+  select(name = to, Taxa = `16S_Taxa2`, Module_Color) %>% 
+  mutate(Domain = "Prokaryote (16S)", Label = name)
+
+full_nodes <- bind_rows(nodes_18S, nodes_16S) %>%
+  distinct(name, .keep_all = TRUE) 
+
+module_list <- unique(full_nodes$Module_Color)
+
+# Loop through each module and plot separately
+for (current_module in module_list) {
+  
+  cat(sprintf("\n\n## Module: %s\n\n", current_module))
+  
+  # Filter data for the current module
+  module_nodes <- full_nodes %>% 
+    filter(Module_Color == current_module)
+  
+  module_edges <- full_filtered_df %>%
+    filter(from %in% module_nodes$name & to %in% module_nodes$name)
+  
+  if (nrow(module_edges) == 0) {
+    cat(sprintf("Module %s has no internal connections above threshold. Skipping.\n\n",
+                current_module))
+    next
+  }
+  
+  # Create igraph object
+  module_graph <- graph_from_data_frame(
+    d = module_edges, 
+    vertices = module_nodes, 
+    directed = FALSE
+  )
+  
+  # Visualize the module network
+  network_plot <- ggraph(module_graph, layout = 'fr') + 
+    geom_edge_fan(
+      aes(color = weight > 0, width = abs(weight), alpha = abs(weight)),
+      show.legend = TRUE
+    ) +
+    scale_edge_width_continuous(range = c(0.2, 1), name = "|Correlation|") +
+    scale_edge_color_manual(
+      values = c("FALSE" = "blue", "TRUE" = "red"),
+      labels = c("Negative", "Positive"),
+      name = "Correlation Sign"
+    ) +
+    geom_node_point(
+      aes(color = Taxa, shape = Domain, size = 2)
+    ) +
+    scale_shape_manual(
+      values = c("Eukaryote (18S)" = 17, "Prokaryote (16S)" = 19),
+      name = "Domain"
+    ) +
+    geom_node_text(aes(label = Label), repel = TRUE, size = 2) +
+    labs(
+      title = paste0("Module: ", current_module,
+                     " Network (N=", vcount(module_graph), " ASVs)"),
+      subtitle = paste0("Filtered: |r| > ", R_cutoff, " and P < ", P_cutoff)
+    ) +
+    theme_graph()
+  
+  print(network_plot)
+  
+  # Save SVG
+  filename <- paste0("figs/Network_Module_", current_module, ".svg")
+  ggsave(filename, plot = network_plot, width = 8, height = 8, dpi = 600)
+}
+```
+
+# Core Taxa–Environment Time Series
+
+Plot the temporal dynamics of Planktothrix and a correlated environmental
+variable (sdo) across lakes, for the yellow and blue WGCNA modules.
+
+```{r define-taxa-processing}
+# Helper function to process taxa data for time series plotting
+process_taxa_data <- function(file_path) {
+  read_csv(file_path, show_col_types = FALSE) %>%
+    filter(Taxa %in% c("Planktothrix", "sdo")) %>%
+    pivot_longer(
+      cols = starts_with(c("LM", "LR", "TTL")),
+      names_to = "Sample_ID",
+      values_to = "Counts"
+    ) %>%
+    mutate(
+      Lake = str_extract(Sample_ID, "^(LM|LR|TTL)"),
+      Date_String = str_extract(Sample_ID, "\\d{1}-\\d{1,2}$"),
+      Date = as.Date(paste0("2024-", Date_String), format = "%Y-%m-%d")
+    ) %>%
+    group_by(Taxa, Lake, Date) %>%
+    summarise(
+      Mean_Count = mean(Counts, na.rm = TRUE),
+      SD_Count = sd(Counts, na.rm = TRUE),
+      .groups = 'drop'
+    )
+}
+```
+
+```{r core-taxa-plots, fig.width=6.5, fig.height=9}
+# Load data for yellow and blue modules
+yellow_summary <- process_taxa_data("data/correlations_yellow_sdo.csv")
+blue_summary   <- process_taxa_data("data/correlations_blue_sdo.csv")
+
+# --- Plot A: Yellow Module ---
+plot_yellow <- yellow_summary %>%
+  ggplot(aes(x = Date, y = Mean_Count, color = Taxa, group = Taxa)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = Mean_Count - SD_Count,
+                    ymax = Mean_Count + SD_Count),
+                width = 0, linewidth = 0.5) +
+  facet_grid(Taxa ~ Lake, scales = "free_y") +
+  scale_color_manual(values = c("Planktothrix" = rgb(218, 185, 46,
+                                                     maxColorValue = 255),
+                                "NP" = "grey50")) +
+  scale_x_date(date_labels = "%m-%d", date_breaks = "2 weeks") +
+  labs(title = "Yellow Module",
+       x = "Sampling Date",
+       y = "Average ASV Count (Mean +/- SD)",
+       color = "Taxa") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+# --- Plot B: Blue Module ---
+plot_blue <- blue_summary %>%
+  ggplot(aes(x = Date, y = Mean_Count, color = Taxa, group = Taxa)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = Mean_Count - SD_Count,
+                    ymax = Mean_Count + SD_Count),
+                width = 0, linewidth = 0.5) +
+  facet_grid(Taxa ~ Lake, scales = "free_y") +
+  scale_color_manual(values = c("Planktothrix" = rgb(218, 185, 46,
+                                                     maxColorValue = 255),
+                                "NP" = "grey50")) +
+  scale_x_date(date_labels = "%m-%d", date_breaks = "2 weeks") +
+  labs(title = "Blue Module",
+       x = "Sampling Date",
+       y = "Average ASV Count (Mean +/- SD)",
+       color = "Taxa") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+# --- Combine and label A/B ---
+combined_plot <- plot_yellow / plot_blue + 
+  plot_annotation(tag_levels = 'A')
+
+print(combined_plot)
+
+ggsave("figs/combined_modules_sdo.png", combined_plot,
+       width = 6.5, height = 9, units = "in")
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
