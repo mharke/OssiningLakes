@@ -52,7 +52,7 @@ This document contains code for:
 ## Contents
 
 All input files are available in the `data/` directory of the
-[GitHub repository](https://github.com/YOUR-USERNAME/ossining-lakes-2023).
+[GitHub repository](https://github.com/mharke/OssiningLakes).
 Raw sequences are publicly available under
 [BioProject PRJNA_XXXXXXX](https://www.ncbi.nlm.nih.gov/bioproject/PRJNA_XXXXXXX).
 
