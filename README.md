@@ -74,7 +74,7 @@ Or use the **Knit** button in RStudio.
 2. Go to **Settings > Pages**.
 3. Under **Source**, select **Deploy from a branch**.
 4. Set branch to `main` and folder to `/docs`.
-5. Save — your site will be live at `https://YOUR-USERNAME.github.io/ossining-lakes-2023/`.
+5. Save — your site will be live at `https://mharke.github.io/ossining-lakes-2023/`.
 
 ## Last updated
 
