@@ -1,6 +1,6 @@
 ---
 title: "Ossining Lakes Microbial Community Analysis (2023)"
-author: "[Your Name(s)]"
+author: "Matthew Harke, PhD"
 date: "`r format(Sys.Date(), '%m/%d/%Y')`"
 output:
   html_document:

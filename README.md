@@ -8,7 +8,7 @@ Code for data analysis and figure generation for the study of microbial (16S and
 
 **Citation:** [Journal reference here]
 
-### [All code and analyses presented here.](https://YOUR-GITHUB-USERNAME.github.io/ossining-lakes-2023/)
+### [All code and analyses presented here.](https://mharke.github.io/ossining-lakes-2023/)
 
 ## Contents
 
