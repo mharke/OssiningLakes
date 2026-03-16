@@ -4,9 +4,9 @@
 
 Code for data analysis and figure generation for the study of microbial (16S and 18S rRNA gene) communities in three Ossining-area lakes: Lake Mohegan, Lake Rippowam, and Teatown Lake.
 
-**Authors:** [Your name(s) here]
+**Authors:** Taylor F. Gibson, Kayley Pugh, Matthew J. Harke
 
-**Citation:** [Journal reference here]
+**Citation:** Submitted to Harmful Algae
 
 ### [All code and analyses presented here.](https://mharke.github.io/ossining-lakes-2023/)
 
@@ -48,7 +48,7 @@ Raw amplicon sequences are publicly available under BioProject [PRJNA_XXXXXXX](h
 
 ## Working R environment
 
-Analysis was performed in **R version X.X.X**. Key packages:
+Analysis was performed in **R version 4.5.2 (2025-10-31 ucrt)**. Key packages:
 
 - [WGCNA](https://cran.r-project.org/package=WGCNA) — Weighted correlation network analysis
 - [vegan](https://cran.r-project.org/package=vegan) — Community ecology (Hellinger transformation)
