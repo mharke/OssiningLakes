@@ -8,7 +8,7 @@ Code for data analysis and figure generation for the study of microbial (16S and
 
 **Citation:** Submitted to Harmful Algae
 
-### [All code and analyses presented here.](https://mharke.github.io/ossining-lakes-2023/)
+### [All code and analyses presented here.](https://mharke.github.io/OssiningLakes/)
 
 ## Contents
 
