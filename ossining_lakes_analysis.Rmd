@@ -1,7 +1,12 @@
 ---
 title: "Ossining Lakes Microbial Community Analysis (2023)"
-author: "Matthew Harke, PhD"
+author: "Taylor F. Gibson, Kayley Pugh, Matthew J. Harke"
 date: "`r format(Sys.Date(), '%m/%d/%Y')`"
+knit: (function(input_file, encoding) {
+  out_dir <- 'docs';
+  rmarkdown::render(input_file,
+    encoding = encoding,
+    output_file = file.path(dirname(input_file), out_dir, 'index.html'))})
 output:
   html_document:
     toc: true
@@ -29,7 +34,7 @@ knitr::opts_chunk$set(
 
 **[Manuscript title here]**
 
-[Author list and journal citation here]
+Gibson, T.F., Pugh, K., & Harke, M.J. (*Submitted*) [Manuscript title]. *Harmful Algae*.
 
 ## Summary
 
@@ -41,13 +46,14 @@ sampling event.
 
 This document contains code for:
 
-- Data loading, transformation, and filtering of 16S and 18S ASV count tables
-- Weighted Gene Co-expression Network Analysis (WGCNA) to identify modules of co-occurring ASVs
+- Diversity analysis of 16S and 18S amplicon data (alpha diversity, community
+  composition, PCoA ordination, PERMANOVA)
+- Weighted Gene Co-expression Network Analysis (WGCNA) to identify modules of
+  co-occurring ASVs
 - Module–trait (environmental parameter) correlation analysis
 - Intramodular connectivity and hub taxa identification
-- Inter-domain (16S vs 18S) correlation analysis within WGCNA modules
+- Inter-domain (16S vs 18S) correlation analysis within modules
 - Network visualization of inter-domain associations
-- Core taxa–environment time series plotting
 
 ## Contents
 
@@ -61,14 +67,19 @@ Raw sequences are publicly available under
 The following analysis was performed in **R version `r getRversion()`**.
 
 ```{r load-libraries, message=FALSE, warning=FALSE}
-# --- Core WGCNA and ecology packages ---
+# --- Core analysis packages ---
 library(WGCNA)
 library(vegan)
 library(RColorBrewer)
 
+# --- Phyloseq and microbiome ---
+library(phyloseq)
+library(microbiome)
+
 # --- Tidyverse for data wrangling and plotting ---
 library(tidyverse)    # includes ggplot2, dplyr, readr, tidyr, stringr, purrr
 library(lubridate)
+library(readxl)
 
 # --- Network visualization ---
 library(igraph)
@@ -76,6 +87,9 @@ library(ggraph)
 
 # --- Plot layout ---
 library(patchwork)
+
+# --- Pairwise PERMANOVA ---
+library(metagMisc)
 
 # Enable multithreading for WGCNA
 enableWGCNAThreads()
@@ -88,6 +102,653 @@ enableWGCNAThreads()
 # Create output directory for WGCNA results
 dir.create("results/wgcna", recursive = TRUE, showWarnings = FALSE)
 ```
+
+# 16S and 18S Diversity Analysis (2023)
+
+## 16S Prokaryote Community (2023) {.tabset}
+
+> **NOTE:** This section requires the DADA2-derived ASV tables (`asv_otu_rl.csv`,
+> `asv_tax_rl.csv`) for 16S 2023 data and the sample metadata with `Name`,
+> `Date_Sam`, `Lake`, and `Month` columns. These files are generated upstream by
+> the DADA2 pipeline and are not included in this repository. If you do not have
+> these files, set `eval = FALSE` for these chunks or skip to [WGCNA Analysis].
+> Raw sequences are available under BioProject PRJNA_XXXXXXX.
+
+### Import data and create phyloseq object
+
+```{r import-16S-2023, eval=FALSE}
+# --- Import 16S 2023 data ---
+# Sequence count table (DADA2 output)
+otutab_16S23 <- read.csv("data/16S_2023_asv_otu_rl.csv", check.names = FALSE)
+rownames(otutab_16S23) <- otutab_16S23[, 1]
+otutab_16S23 <- otutab_16S23[, 2:46]
+otutab_16S23 <- otu_table(otutab_16S23, taxa_are_rows = TRUE)
+
+# Sequence taxonomy classifications (DADA2 output)
+tax_16S23 <- read.csv("data/16S_2023_asv_tax_rl.csv", header = TRUE)
+rownames(tax_16S23) <- taxa_names(otutab_16S23)
+tax_16S23 <- tax_16S23[, 2:9]
+tax_16S23 <- as.matrix(tax_16S23)
+tax_16S23 <- tax_table(tax_16S23)
+taxa_names(tax_16S23) <- taxa_names(otutab_16S23)
+
+# Sample metadata
+meta_16S23 <- read_xlsx("data/Ossining_Lake_Metadata_2023.xlsx")
+meta_16S23 <- sample_data(meta_16S23)
+rownames(meta_16S23) <- meta_16S23$Name
+
+# Build phyloseq object
+physeq_16S23 <- merge_phyloseq(otutab_16S23, tax_16S23, meta_16S23)
+
+# Remove samples with zero counts
+physeq_16S23 <- prune_samples(sample_sums(physeq_16S23) >= 1, physeq_16S23)
+
+# Remove chloroplast sequences
+physeq_16S23 <- subset_taxa(physeq_16S23, Order != "Chloroplast")
+```
+
+### Alpha diversity
+
+```{r alpha-16S-2023, eval=FALSE}
+# Calculate alpha diversity metrics
+alpha_16S23 <- microbiome::alpha(physeq_16S23)
+write.csv(alpha_16S23, "results/16S_2023_alpha_diversity.csv")
+
+# Plot observed richness by sampling date, faceted by lake
+plot_richness(physeq_16S23, x = "Date_Sam", measures = "Observed",
+              title = "16S 2023 Richness") +
+  geom_boxplot() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1),
+        axis.text = element_text(size = 14),
+        axis.title.x = element_blank()) +
+  facet_grid(. ~ Lake, scales = "free")
+```
+
+### Phylum-level community composition
+
+```{r phylum-barplot-16S-2023, eval=FALSE}
+# Agglomerate to phylum level, convert to relative abundance
+p_16S23 <- subset_taxa(physeq_16S23) %>%
+  tax_glom(taxrank = "Phylum") %>%
+  transform_sample_counts(function(x) x / sum(x)) %>%
+  psmelt()
+
+# Summarize relative abundance by lake, month, and phylum
+relabund_16S23_phylum <- p_16S23 %>%
+  group_by(Lake, Month, Date_Sam, Phylum) %>%
+  summarize(RelAbund = sum(Abundance), .groups = "drop")
+write.csv(relabund_16S23_phylum,
+          "results/16S_2023_relative_abundance_phylum.csv",
+          row.names = FALSE)
+
+# Generate color palette
+colourCount <- length(unique(p_16S23$Phylum))
+getPalette <- colorRampPalette(brewer.pal(12, "Paired"))
+
+# Plot phylum-level relative abundance by lake
+ggplot(arrange(p_16S23, Phylum),
+       aes(x = Date_Sam, y = Abundance, fill = Phylum)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        plot.title = element_text(size = 10, hjust = 0.5),
+        legend.text = element_text(size = 10),
+        axis.text = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text.x = element_text(size = 9)) +
+  ylab("Relative Read Abundance") +
+  scale_fill_manual(values = getPalette(colourCount)) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  guides(fill = guide_legend(ncol = 2)) +
+  facet_grid(. ~ Lake, scales = "free") +
+  ggtitle("16S 2023 Relative Read Abundance")
+```
+
+### Cyanobacteria community composition
+
+```{r cyano-barplot-16S-2023, eval=FALSE}
+# Subset Cyanobacteriota, agglomerate to edited genus level (Taxa column)
+cyano_16S23 <- subset_taxa(physeq_16S23, Phylum == "Cyanobacteriota") %>%
+  tax_glom(taxrank = "Taxa") %>%
+  transform_sample_counts(function(x) x / sum(x)) %>%
+  psmelt() %>%
+  filter(Abundance > 0.01)
+
+# Summarize relative abundance
+relabund_16S23_cyano <- cyano_16S23 %>%
+  group_by(Lake, Month, Date_Sam, Taxa) %>%
+  summarize(RelAbund = sum(Abundance), .groups = "drop")
+write.csv(relabund_16S23_cyano,
+          "results/16S_2023_relative_abundance_cyano.csv",
+          row.names = FALSE)
+
+# Generate color palette
+colourCount <- length(unique(cyano_16S23$Taxa))
+getPalette <- colorRampPalette(brewer.pal(8, "Set1"))
+
+# Plot cyanobacteria relative abundance by lake
+ggplot(arrange(cyano_16S23, Taxa),
+       aes(x = Date_Sam, y = Abundance, fill = Taxa)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        axis.title.x = element_blank(),
+        legend.text = element_text(size = 10),
+        legend.position = "right",
+        axis.text = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text.x = element_text(size = 9)) +
+  ylab("Relative Read Abundance") +
+  scale_fill_manual(values = getPalette(colourCount)) +
+  scale_y_continuous(limits = c(0, 1.001), expand = c(0, 0)) +
+  guides(fill = guide_legend(ncol = 1)) +
+  facet_grid(. ~ Lake, scales = "free") +
+  ggtitle("16S 2023 Cyanobacteria Relative Read Abundance")
+```
+
+### PCoA ordination
+
+```{r pcoa-16S-2023, eval=FALSE}
+# --- PCoA for each lake individually ---
+
+# Lake Mohegan
+LM_16S23 <- subset_samples(physeq_16S23, Lake == "Lake Mohegan")
+LM_16S23rare <- rarefy_even_depth(LM_16S23)
+pcoa_LM_16S23 <- ordinate(physeq = LM_16S23rare, method = "PCoA", distance = "bray")
+ord_LM_16S23 <- plot_ordination(physeq = LM_16S23rare,
+                                ordination = pcoa_LM_16S23,
+                                color = "Month",
+                                title = "Lake Mohegan") +
+  geom_point(aes(color = Month), alpha = 0.75, size = 4) +
+  theme_bw() +
+  theme(text = element_text(size = 14)) +
+  guides(color = guide_legend(title = "Month", ncol = 1))
+
+# Lake Rippowam
+LR_16S23 <- subset_samples(physeq_16S23, Lake == "Lake Rippowam")
+LR_16S23rare <- rarefy_even_depth(LR_16S23)
+pcoa_LR_16S23 <- ordinate(physeq = LR_16S23rare, method = "PCoA", distance = "bray")
+ord_LR_16S23 <- plot_ordination(physeq = LR_16S23rare,
+                                ordination = pcoa_LR_16S23,
+                                color = "Month",
+                                title = "Lake Rippowam") +
+  geom_point(aes(color = Month), alpha = 0.75, size = 4) +
+  theme_bw() +
+  theme(text = element_text(size = 14)) +
+  guides(color = guide_legend(title = "Month", ncol = 1))
+
+# Teatown Lake
+TTL_16S23 <- subset_samples(physeq_16S23, Lake == "Teatown Lake")
+TTL_16S23rare <- rarefy_even_depth(TTL_16S23)
+pcoa_TTL_16S23 <- ordinate(physeq = TTL_16S23rare, method = "PCoA", distance = "bray")
+ord_TTL_16S23 <- plot_ordination(physeq = TTL_16S23rare,
+                                 ordination = pcoa_TTL_16S23,
+                                 color = "Month",
+                                 title = "Teatown Lake") +
+  geom_point(aes(color = Month), alpha = 0.75, size = 4) +
+  theme_bw() +
+  theme(text = element_text(size = 14)) +
+  guides(color = guide_legend(title = "Month", ncol = 1))
+
+# Combined PCoA plot (patchwork)
+ord_LM_16S23 / ord_LR_16S23 / ord_TTL_16S23 +
+  plot_annotation("PCoA of 16S 2023 Data")
+```
+
+### Cyanobacteria PCoA
+
+```{r pcoa-cyano-16S-2023, eval=FALSE}
+# Subset cyanobacteria for PCoA
+cb_16S23 <- subset_taxa(physeq_16S23, Phylum == "Cyanobacteriota")
+
+# Lake Mohegan cyanobacteria
+LMcb_16S23 <- subset_samples(cb_16S23, Lake == "Lake Mohegan")
+LMcbrare_16S23 <- rarefy_even_depth(LMcb_16S23)
+LMcbpca_16S23 <- ordinate(LMcbrare_16S23, "PCoA")
+cb_ord_LM_16S23 <- plot_ordination(LMcbrare_16S23, LMcbpca_16S23,
+                                    color = "Month",
+                                    title = "Lake Mohegan") +
+  geom_point(aes(color = Month), alpha = 0.75, size = 4) +
+  theme_bw() +
+  theme(text = element_text(size = 14)) +
+  guides(color = guide_legend(title = "Month", ncol = 1))
+
+# Lake Rippowam cyanobacteria
+LRcb_16S23 <- subset_samples(cb_16S23, Lake == "Lake Rippowam")
+LRcbrare_16S23 <- rarefy_even_depth(LRcb_16S23)
+LRcbpca_16S23 <- ordinate(LRcbrare_16S23, "PCoA")
+cb_ord_LR_16S23 <- plot_ordination(LRcbrare_16S23, LRcbpca_16S23,
+                                    color = "Month",
+                                    title = "Lake Rippowam") +
+  geom_point(aes(color = Month), alpha = 0.75, size = 4) +
+  theme_bw() +
+  theme(text = element_text(size = 14)) +
+  guides(color = guide_legend(title = "Month", ncol = 1))
+
+# Teatown Lake cyanobacteria
+TTLcb_16S23 <- subset_samples(cb_16S23, Lake == "Teatown Lake")
+TTLcbrare_16S23 <- rarefy_even_depth(TTLcb_16S23)
+TTLcbpca_16S23 <- ordinate(TTLcbrare_16S23, "PCoA")
+cb_ord_TTL_16S23 <- plot_ordination(TTLcbrare_16S23, TTLcbpca_16S23,
+                                     color = "Month",
+                                     title = "Teatown Lake") +
+  geom_point(aes(color = Month), alpha = 0.75, size = 4) +
+  theme_bw() +
+  theme(text = element_text(size = 14)) +
+  guides(color = guide_legend(title = "Month", ncol = 1))
+
+# Combined cyanobacteria PCoA
+cb_ord_LM_16S23 / cb_ord_LR_16S23 / cb_ord_TTL_16S23 +
+  plot_annotation("Cyanobacteria PCoA of 16S 2023 Data")
+```
+
+### PERMANOVA
+
+```{r permanova-16S-2023, eval=FALSE}
+# --- Whole community PERMANOVA by lake ---
+
+# Lake Mohegan
+LMbray16S23 <- phyloseq::distance(LM_16S23rare, method = "bray")
+LMdf16S23 <- data.frame(sample_data(LM_16S23rare))
+LMperm16S23 <- adonis2(LMbray16S23 ~ Month, data = LMdf16S23)
+LMperm16S23  # significant
+
+# Lake Rippowam
+LRbray16S23 <- phyloseq::distance(LR_16S23rare, method = "bray")
+LRdf16S23 <- data.frame(sample_data(LR_16S23rare))
+LRperm16S23 <- adonis2(LRbray16S23 ~ Month, data = LRdf16S23)
+LRperm16S23  # significant
+
+# Teatown Lake
+TTLbray16S23 <- phyloseq::distance(TTL_16S23rare, method = "bray")
+TTLdf16S23 <- data.frame(sample_data(TTL_16S23rare))
+TTLperm16S23 <- adonis2(TTLbray16S23 ~ Month, data = TTLdf16S23)
+TTLperm16S23  # significant
+
+# --- Cyanobacteria PERMANOVA by lake ---
+
+cLMbray16S23 <- phyloseq::distance(LMcbrare_16S23, method = "bray")
+cLMdf16S23 <- data.frame(sample_data(LMcbrare_16S23))
+cLMperm16S23 <- adonis2(cLMbray16S23 ~ Month, data = cLMdf16S23)
+cLMperm16S23  # significant
+
+cLRbray16S23 <- phyloseq::distance(LRcbrare_16S23, method = "bray")
+cLRdf16S23 <- data.frame(sample_data(LRcbrare_16S23))
+cLRperm16S23 <- adonis2(cLRbray16S23 ~ Month, data = cLRdf16S23)
+cLRperm16S23  # significant
+
+cTTLbray16S23 <- phyloseq::distance(TTLcbrare_16S23, method = "bray")
+cTTLdf16S23 <- data.frame(sample_data(TTLcbrare_16S23))
+cTTLperm16S23 <- adonis2(cTTLbray16S23 ~ Month, data = cTTLdf16S23)
+cTTLperm16S23  # significant
+
+# --- All lakes combined PERMANOVA (Lake * Month interaction) ---
+
+# Whole community
+Lake23rare16 <- rarefy_even_depth(physeq_16S23)
+Lake23bray16 <- phyloseq::distance(Lake23rare16, method = "bray")
+Lake23df16 <- data.frame(sample_data(Lake23rare16))
+Lake23perm16 <- adonis2(Lake23bray16 ~ Lake * Month, data = Lake23df16)
+Lake23perm16  # All combinations significant
+
+# Cyanobacteria only
+cb_16S23rare <- rarefy_even_depth(cb_16S23)
+cLake23bray <- phyloseq::distance(cb_16S23rare, method = "bray")
+cLake23df <- data.frame(sample_data(cb_16S23rare))
+cLake23perm <- adonis2(cLake23bray ~ Lake * Month, data = cLake23df)
+cLake23perm  # All combinations significant
+```
+
+### Pairwise PERMANOVA
+
+```{r pairwise-permanova-16S-2023, eval=FALSE}
+# Pairwise comparisons following significant PERMANOVA results
+
+# Whole community: per-lake pairwise by Month
+LMdf16S23$Month <- as.factor(LMdf16S23$Month)
+LMpairwise16S23 <- adonis_pairwise(x = LMdf16S23, dd = LMbray16S23,
+                                    group.var = "Month")
+LMpairwise16S23  # all month combos significant
+
+LRdf16S23$Month <- as.factor(LRdf16S23$Month)
+LRpairwise16S23 <- adonis_pairwise(x = LRdf16S23, dd = LRbray16S23,
+                                    group.var = "Month")
+LRpairwise16S23  # all significant except Aug/Sept
+
+TTLdf16S23$Month <- as.factor(TTLdf16S23$Month)
+TTLpairwise16S23 <- adonis_pairwise(x = TTLdf16S23, dd = TTLbray16S23,
+                                     group.var = "Month")
+TTLpairwise16S23  # all significant except Aug/Sept, July/June
+
+# Cyanobacteria: per-lake pairwise by Month
+cLMdf16S23$Month <- as.factor(cLMdf16S23$Month)
+cLMpairwise16S23 <- adonis_pairwise(x = cLMdf16S23, dd = cLMbray16S23,
+                                     group.var = "Month")
+cLMpairwise16S23  # all significant except July/June
+
+cLRdf16S23$Month <- as.factor(cLRdf16S23$Month)
+cLRpairwise16S23 <- adonis_pairwise(x = cLRdf16S23, dd = cLRbray16S23,
+                                     group.var = "Month")
+cLRpairwise16S23  # Aug/July, Aug/June, July/June, June/Sept significant
+
+cTTLdf16S23$Month <- as.factor(cTTLdf16S23$Month)
+cTTLpairwise16S23 <- adonis_pairwise(x = cTTLdf16S23, dd = cTTLbray16S23,
+                                      group.var = "Month")
+cTTLpairwise16S23  # Aug/July, Aug/June, July/Sept, June/Sept significant
+
+# All lakes combined: pairwise by Lake and by Month
+Lake23df16$Month <- as.factor(Lake23df16$Month)
+Lake23df16$Lake <- as.factor(Lake23df16$Lake)
+
+Lake23pairwise16 <- adonis_pairwise(x = Lake23df16, dd = Lake23bray16,
+                                     group.var = "Lake")
+Lake23pairwise16  # all 3 lake combos significant
+
+Month23pairwise16 <- adonis_pairwise(x = Lake23df16, dd = Lake23bray16,
+                                      group.var = "Month")
+Month23pairwise16  # all significant except Aug/Sept
+
+# All lakes cyanobacteria combined
+cLake23df$Month <- as.factor(cLake23df$Month)
+cLake23df$Lake <- as.factor(cLake23df$Lake)
+
+cLake23pairwise <- adonis_pairwise(x = cLake23df, dd = cLake23bray,
+                                    group.var = "Lake")
+cLake23pairwise  # all 3 lake combos significant
+
+cMonth23pairwise <- adonis_pairwise(x = cLake23df, dd = cLake23bray,
+                                     group.var = "Month")
+cMonth23pairwise  # all significant except July/June
+```
+
+## 18S Eukaryote Community (2023) {.tabset}
+
+> **NOTE:** This section requires the DADA2-derived ASV tables for 18S 2023 data
+> (PR2 reference database). These are generated upstream and are not included in
+> this repository. Set `eval = FALSE` if input files are unavailable.
+
+### Import data and create phyloseq object
+
+```{r import-18S-2023, eval=FALSE}
+# --- Import 18S 2023 data ---
+# Sequence count table (DADA2 output, PR2 database)
+otutab_18S23 <- read.csv("data/18S_2023_asv_otu_rl.csv", check.names = FALSE)
+rownames(otutab_18S23) <- otutab_18S23[, 1]
+otutab_18S23 <- otutab_18S23[, 2:46]
+otutab_18S23 <- otu_table(otutab_18S23, taxa_are_rows = TRUE)
+
+# Sequence taxonomy classifications (PR2 database)
+tax_18S23 <- read.csv("data/18S_2023_asv_tax_rl.csv", header = TRUE)
+rownames(tax_18S23) <- taxa_names(otutab_18S23)
+tax_18S23 <- tax_18S23[, 2:11]
+tax_18S23 <- as.matrix(tax_18S23)
+tax_18S23 <- tax_table(tax_18S23)
+taxa_names(tax_18S23) <- taxa_names(otutab_18S23)
+
+# Sample metadata
+meta_18S23 <- read_xlsx("data/Ossining_Lake_Metadata_2023.xlsx")
+meta_18S23 <- sample_data(meta_18S23)
+#rownames(meta_18S23) <- meta_18S23$Name2
+
+# Build phyloseq object
+physeq_18S23 <- merge_phyloseq(otutab_18S23, tax_18S23, meta_18S23)
+
+# Remove samples with zero counts
+physeq_18S23 <- prune_samples(sample_sums(physeq_18S23) >= 1, physeq_18S23)
+```
+
+### Alpha diversity
+
+```{r alpha-18S-2023, eval=FALSE}
+# Calculate alpha diversity metrics
+alpha_18S23 <- microbiome::alpha(physeq_18S23)
+write.csv(alpha_18S23, "results/18S_2023_alpha_diversity.csv")
+
+# Plot observed richness by sampling date, faceted by lake
+plot_richness(physeq_18S23, x = "Date_Sam", measures = "Observed",
+              title = "18S 2023 Richness") +
+  geom_boxplot() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1),
+        axis.text = element_text(size = 14),
+        axis.title.x = element_blank()) +
+  facet_grid(. ~ Lake, scales = "free")
+```
+
+### Division-level community composition
+
+```{r division-barplot-18S-2023, eval=FALSE}
+# Agglomerate to edited division level (Taxa column), convert to relative abundance
+p_18S23 <- subset_taxa(physeq_18S23) %>%
+  tax_glom(taxrank = "Taxa") %>%
+  transform_sample_counts(function(x) x / sum(x)) %>%
+  psmelt()
+
+# Summarize relative abundance
+relabund_18S23_div <- p_18S23 %>%
+  group_by(Lake, Month, Date_Sam, Taxa) %>%
+  summarize(RelAbund = sum(Abundance), .groups = "drop")
+write.csv(relabund_18S23_div,
+          "results/18S_2023_relative_abundance_division.csv",
+          row.names = FALSE)
+
+# Generate color palette
+colourCount <- length(unique(p_18S23$Taxa))
+getPalette <- colorRampPalette(brewer.pal(12, "Paired"))
+
+# Plot division-level relative abundance by lake
+ggplot(arrange(p_18S23, Taxa),
+       aes(x = Date_Sam, y = Abundance, fill = Taxa)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        plot.title = element_text(size = 10, hjust = 0.5),
+        legend.text = element_text(size = 10),
+        axis.text = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text.x = element_text(size = 9)) +
+  ylab("Relative Read Abundance") +
+  scale_fill_manual(values = getPalette(colourCount)) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  guides(fill = guide_legend(ncol = 2)) +
+  facet_grid(. ~ Lake, scales = "free") +
+  ggtitle("18S 2023 Relative Read Abundance")
+```
+
+### Chytrid community composition
+
+```{r chytrid-barplot-18S-2023, eval=FALSE}
+# Subset Chytridiomycota, agglomerate to order level
+chytrid_18S23 <- subset_taxa(physeq_18S23, Class == "Chytridiomycota") %>%
+  tax_glom(taxrank = "Order") %>%
+  transform_sample_counts(function(x) x / sum(x)) %>%
+  psmelt() %>%
+  filter(Abundance > 0.01)
+
+# Summarize relative abundance
+relabund_18S23_chytrid <- chytrid_18S23 %>%
+  group_by(Lake, Month, Date_Sam, Order) %>%
+  summarize(RelAbund = sum(Abundance), .groups = "drop")
+write.csv(relabund_18S23_chytrid,
+          "results/18S_2023_relative_abundance_chytrid.csv",
+          row.names = FALSE)
+
+# Generate color palette
+colourCount <- length(unique(chytrid_18S23$Order))
+getPalette <- colorRampPalette(brewer.pal(8, "Set1"))
+
+# Plot chytrid relative abundance by lake
+ggplot(arrange(chytrid_18S23, Order),
+       aes(x = Date_Sam, y = Abundance, fill = Order)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        axis.title.x = element_blank(),
+        legend.text = element_text(size = 10),
+        legend.position = "right",
+        axis.text = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text.x = element_text(size = 9)) +
+  ylab("Relative Read Abundance") +
+  scale_fill_manual(values = getPalette(colourCount)) +
+  scale_y_continuous(limits = c(0, 1.001), expand = c(0, 0)) +
+  guides(fill = guide_legend(ncol = 1)) +
+  facet_grid(. ~ Lake, scales = "free") +
+  ggtitle("18S 2023 Chytrid Relative Read Abundance")
+```
+
+### Metazoa community composition
+
+```{r metazoa-barplot-18S-2023, eval=FALSE}
+# Subset Metazoa, agglomerate to genus level
+metazoa_18S23 <- subset_taxa(physeq_18S23, Subdivision == "Metazoa") %>%
+  tax_glom(taxrank = "Genus") %>%
+  transform_sample_counts(function(x) x / sum(x)) %>%
+  psmelt()
+
+# Summarize relative abundance
+relabund_18S23_metazoa <- metazoa_18S23 %>%
+  group_by(Lake, Month, Date_Sam, Genus) %>%
+  summarize(RelAbund = sum(Abundance), .groups = "drop")
+write.csv(relabund_18S23_metazoa,
+          "results/18S_2023_relative_abundance_metazoa.csv",
+          row.names = FALSE)
+
+# Generate color palette
+colourCount <- length(unique(metazoa_18S23$Genus))
+getPalette <- colorRampPalette(brewer.pal(8, "Set1"))
+
+# Plot metazoa relative abundance by lake
+ggplot(arrange(metazoa_18S23, Genus),
+       aes(x = Date_Sam, y = Abundance, fill = Genus)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        axis.title.x = element_blank(),
+        legend.text = element_text(size = 10),
+        legend.position = "right",
+        axis.text = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text.x = element_text(size = 9)) +
+  ylab("Relative Read Abundance") +
+  scale_fill_manual(values = getPalette(colourCount)) +
+  scale_y_continuous(limits = c(0, 1.001), expand = c(0, 0)) +
+  guides(fill = guide_legend(ncol = 2)) +
+  facet_grid(. ~ Lake, scales = "free") +
+  ggtitle("18S 2023 Metazoa Relative Read Abundance")
+```
+
+### PCoA ordination
+
+```{r pcoa-18S-2023, eval=FALSE}
+# --- PCoA for each lake individually ---
+
+# Lake Mohegan
+LM_18S23 <- subset_samples(physeq_18S23, Lake == "Lake Mohegan")
+LM_18S23rare <- rarefy_even_depth(LM_18S23)
+pcoa_LM_18S23 <- ordinate(physeq = LM_18S23rare, method = "PCoA", distance = "bray")
+ord_LM_18S23 <- plot_ordination(physeq = LM_18S23rare,
+                                ordination = pcoa_LM_18S23,
+                                color = "Month",
+                                title = "Lake Mohegan") +
+  geom_point(aes(color = Month), alpha = 0.75, size = 4) +
+  theme_bw() +
+  theme(text = element_text(size = 14)) +
+  guides(color = guide_legend(title = "Month", ncol = 1))
+
+# Lake Rippowam
+LR_18S23 <- subset_samples(physeq_18S23, Lake == "Lake Rippowam")
+LR_18S23rare <- rarefy_even_depth(LR_18S23)
+pcoa_LR_18S23 <- ordinate(physeq = LR_18S23rare, method = "PCoA", distance = "bray")
+ord_LR_18S23 <- plot_ordination(physeq = LR_18S23rare,
+                                ordination = pcoa_LR_18S23,
+                                color = "Month",
+                                title = "Lake Rippowam") +
+  geom_point(aes(color = Month), alpha = 0.75, size = 4) +
+  theme_bw() +
+  theme(text = element_text(size = 14)) +
+  guides(color = guide_legend(title = "Month", ncol = 1))
+
+# Teatown Lake
+TTL_18S23 <- subset_samples(physeq_18S23, Lake == "Teatown Lake")
+TTL_18S23rare <- rarefy_even_depth(TTL_18S23)
+pcoa_TTL_18S23 <- ordinate(physeq = TTL_18S23rare, method = "PCoA", distance = "bray")
+ord_TTL_18S23 <- plot_ordination(physeq = TTL_18S23rare,
+                                 ordination = pcoa_TTL_18S23,
+                                 color = "Month",
+                                 title = "Teatown Lake") +
+  geom_point(aes(color = Month), alpha = 0.75, size = 4) +
+  theme_bw() +
+  theme(text = element_text(size = 14)) +
+  guides(color = guide_legend(title = "Month", ncol = 1))
+
+# Combined PCoA plot
+ord_LM_18S23 / ord_LR_18S23 / ord_TTL_18S23 +
+  plot_annotation("PCoA of 18S 2023 Data")
+```
+
+### PERMANOVA
+
+```{r permanova-18S-2023, eval=FALSE}
+# --- 18S PERMANOVA ---
+
+# Lake Mohegan
+LMbray18S23 <- phyloseq::distance(LM_18S23rare, method = "bray")
+LMdf18S23 <- data.frame(sample_data(LM_18S23rare))
+LMperm18S23 <- adonis2(LMbray18S23 ~ Month, data = LMdf18S23)
+LMperm18S23  # NOT significant
+
+# Lake Rippowam
+LRbray18S23 <- phyloseq::distance(LR_18S23rare, method = "bray")
+LRdf18S23 <- data.frame(sample_data(LR_18S23rare))
+LRperm18S23 <- adonis2(LRbray18S23 ~ Month, data = LRdf18S23)
+LRperm18S23  # significant
+
+# Teatown Lake
+TTLbray18S23 <- phyloseq::distance(TTL_18S23rare, method = "bray")
+TTLdf18S23 <- data.frame(sample_data(TTL_18S23rare))
+TTLperm18S23 <- adonis2(TTLbray18S23 ~ Month, data = TTLdf18S23)
+TTLperm18S23  # significant
+
+# All lakes combined (Lake * Month)
+Lake23rare18 <- rarefy_even_depth(physeq_18S23)
+Lake23bray18 <- phyloseq::distance(Lake23rare18, method = "bray")
+Lake23df18 <- data.frame(sample_data(Lake23rare18))
+Lake23perm18 <- adonis2(Lake23bray18 ~ Lake * Month, data = Lake23df18)
+Lake23perm18  # All combinations significant
+```
+
+### Pairwise PERMANOVA
+
+```{r pairwise-permanova-18S-2023, eval=FALSE}
+# Pairwise comparisons following significant 18S PERMANOVA results
+
+# Lake Rippowam (significant)
+LRdf18S23$Month <- as.factor(LRdf18S23$Month)
+LRpairwise18S23 <- adonis_pairwise(x = LRdf18S23, dd = LRbray18S23,
+                                    group.var = "Month")
+LRpairwise18S23  # Aug/June, Aug/Sept, July/June, July/Sept, June/Sept significant
+
+# Teatown Lake (significant)
+TTLdf18S23$Month <- as.factor(TTLdf18S23$Month)
+TTLpairwise18S23 <- adonis_pairwise(x = TTLdf18S23, dd = TTLbray18S23,
+                                     group.var = "Month")
+TTLpairwise18S23  # Aug/July, July/Sept, July/June significant
+
+# All lakes combined
+Lake23df18$Month <- as.factor(Lake23df18$Month)
+Lake23df18$Lake <- as.factor(Lake23df18$Lake)
+
+Lake23pairwise18 <- adonis_pairwise(x = Lake23df18, dd = Lake23bray18,
+                                     group.var = "Lake")
+Lake23pairwise18  # LM/LR, LR/TTL significant
+
+Month23pairwise18 <- adonis_pairwise(x = Lake23df18, dd = Lake23bray18,
+                                      group.var = "Month")
+Month23pairwise18  # June/Sept, July/Sept, Aug/June, Aug/July significant
+```
+
 
 # WGCNA Analysis
 

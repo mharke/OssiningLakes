@@ -17,5 +17,5 @@
 .DS_Store
 Thumbs.db
 
-# Large intermediate results (optional — uncomment if results/ is too large)
+# Large intermediate results (uncomment if results/ is too large for git)
 # results/wgcna/*.csv
