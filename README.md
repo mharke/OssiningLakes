@@ -1,4 +1,4 @@
-# Ossining Lakes Microbial Community Analysis (2023)
+# Ossining Lakes Microbial Community Analysis
 
 ## Overview
 
@@ -6,7 +6,7 @@ Associated code for data analysis and figure generation for the study of microbi
 
 **Authors:** Taylor F. Gibson, Kayley Pugh, Matthew J. Harke
 
-**Citation:** Gibson, T.F., Pugh, K., & Harke, M.J. (*Submitted*) [Manuscript title]. *Harmful Algae*.
+**Citation:** Gibson, T.F., Pugh, K., & Harke, M.J. (*Submitted*) Spatiotemporal Dynamics of Whole Lake Microbiomes and potential Inter-Domain Drivers of Toxic Cyanobacterial Bloom Potential. *Harmful Algae*.
 
 ## Description of contents
 
@@ -121,4 +121,4 @@ Raw amplicon sequences are publicly available under BioProject [PRJNA_XXXXXXX](h
 
 ## Last updated
 
-[Date]
+March 23, 2026
