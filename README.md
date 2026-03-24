@@ -8,8 +8,6 @@ Associated code for data analysis and figure generation for the study of microbi
 
 **Citation:** Gibson, T.F., Pugh, K., & Harke, M.J. (*Submitted*) [Manuscript title]. *Harmful Algae*.
 
-### [All code and analyses presented here.](https://mharke.github.io/OssiningLakes/)
-
 ## Description of contents
 
 ### 1. Study background
@@ -120,26 +118,6 @@ ossining-lakes-2023/
 ## Data availability
 
 Raw amplicon sequences are publicly available under BioProject [PRJNA_XXXXXXX](https://www.ncbi.nlm.nih.gov/bioproject/PRJNA_XXXXXXX).
-
-## Rendering the analysis
-
-To reproduce the HTML report locally:
-
-```r
-# From the project root directory in RStudio, click Knit or run:
-rmarkdown::render("ossining_lakes_analysis.Rmd",
-                  output_file = "docs/index.html")
-```
-
-The `knit:` header in the Rmd file will automatically render to `docs/index.html`.
-
-## Hosting with GitHub Pages
-
-1. Push this repository to GitHub.
-2. Go to **Settings > Pages**.
-3. Under **Source**, select **Deploy from a branch**.
-4. Set branch to `main` and folder to `/docs`.
-5. Save — your site will be live at `https://mharke.github.io/OssiningLakes/`.
 
 ## Last updated
 
