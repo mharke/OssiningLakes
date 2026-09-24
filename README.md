@@ -130,7 +130,7 @@ ossining-lakes-2023/
 
 ## Data availability
 
-Raw amplicon sequences are publicly available under BioProject [PRJNA_XXXXXXX](https://www.ncbi.nlm.nih.gov/bioproject/PRJNA_XXXXXXX).
+Raw amplicon sequences are publicly available under BioProject [PRJNA1443331](https://www.ncbi.nlm.nih.gov/bioproject/PRJNA1443331).
 
 ## Last updated
 
