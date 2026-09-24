@@ -6,7 +6,7 @@ Associated code for data analysis and figure generation for the study of microbi
 
 **Authors:** Taylor F. Gibson, Kayley Pugh, Matthew J. Harke
 
-**Citation:** Gibson, T.F., Pugh, K., & Harke, M.J. (*Submitted*) Spatiotemporal Dynamics of Whole Lake Microbiomes and potential Inter-Domain Drivers of Toxic Cyanobacterial Bloom Potential. *Harmful Algae*.
+**Citation:** Gibson, T.F., Pugh, K., & Harke, M.J. (*In Press*) Spatiotemporal Dynamics of Whole Lake Microbiomes and potential Inter-Domain Associations with Toxic Cyanobacterial Bloom. *Harmful Algae*.
 
 ## Description of contents
 
