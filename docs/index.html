@@ -9,8 +9,15 @@
 </head>
 <body>
   <h1>Ossining Lakes Microbial Community Analysis (2023)</h1>
-  <p>This page will be replaced when the R Markdown analysis is rendered.</p>
-  <p>To generate the full analysis, open <code>ossining_lakes_analysis.Rmd</code> in RStudio and click <strong>Knit</strong>.</p>
+  <p>This page will be replaced when the R Markdown analyses are rendered.</p>
+  <p>The analysis is split across several R Markdown files (run in this order):</p>
+  <ol>
+    <li><code>asv_curation_16S.R</code> and <code>asv_curation_18S.R</code> (produce <code>results/</code> inputs for the files below)</li>
+    <li><code>2023_16S_ReAnalyzed_Diversity.Rmd</code></li>
+    <li><code>2023_18S_ReAnalyzed_Diversity.Rmd</code></li>
+    <li><code>interdomain_cooccurrence_analysis.Rmd</code></li>
+  </ol>
+  <p>Open each in RStudio and click <strong>Knit</strong>, or render all of them with <code>rmarkdown::render()</code>.</p>
   <p><a href="https://github.com/mharke/OssiningLakes">Back to repository</a></p>
 </body>
 </html>

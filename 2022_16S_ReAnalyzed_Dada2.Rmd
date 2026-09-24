@@ -1,0 +1,226 @@
+---
+title: "2022 16S DADA2 Processing"
+output: html_document
+---
+
+> **Reference only -- not executable outside the originating HPC environment.**
+> This Rmd documents the DADA2 workflow for the 2022 16S data. It reads/
+> writes absolute HPC cluster paths and reference databases not part of
+> this repository, and the raw 2022 sequences are not included here.
+> All chunks are set to `eval = FALSE` below so that knitting this file
+> documents the method without attempting to re-run it.
+> **Also note:** unlike the 2023 pipeline, the curated outputs of this
+> 2022 run (`asv_otu_rl_2022_16S.csv`, taxonomy) are not present anywhere
+> in `data/` either -- see the open item on 2022 data in the project notes.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+Installing packages (if not already installed)
+```{r}
+#Installing package: dada2
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("dada2", version = "3.23")
+
+#Installing package: phyloseq
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("phyloseq")
+
+#Installing package: Biostrings
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("Biostrings")
+
+```
+
+Loading libraries and path
+```{r}
+# load required programs
+library(dada2)
+library(phyloseq)
+library(Biostrings)
+library(ggplot2)
+
+# CHANGE to the directory containing the trimmed unzipped fastq files.
+path_test <- "/../../projects/gmgi/ecosystem-diversity/ossininglakes/Re-Run_2026/2022/cutadapt"
+
+#check all files are in the path
+list.files(path_test)
+
+# Forward and reverse fastq file names have format: SAMPLENAME_R1_trimmed.fastq and SAMPLENAME_R2_trimmed.fastq
+fnFs_test <- sort(list.files(path_test, pattern="_R1_trimmed.fastq.gz", full.names = TRUE))
+fnRs_test <- sort(list.files(path_test, pattern="_R2_trimmed.fastq.gz", full.names = TRUE))
+
+# Extract sample names, assuming file names have format: SAMPLENAME_XXX.fastq
+sample.names.test <- sapply(strsplit(basename(fnFs_test), "_"), `[`, 1)
+
+# visualize the quality profiles of the forward reads (note where to truncate)
+jpeg("results/fnFsQuality16S2022_test.jpg",width = 20, height =17, units = "in", res = 300)
+plotQualityProfile(fnFs_test[1:36])
+#truncate at 200
+
+# visualize the quality profiles of the reverse reads (note where to truncate)
+jpeg("results/fnRsQuality16S2022_test.jpg",width = 20, height =17, units = "in", res = 300)
+plotQualityProfile(fnRs_test[1:36])
+#truncate at 140
+
+```
+
+```{r}
+#move samples with less than 1000 reads to cutadapt_removed folder and start again with only the samples with reads >1000
+
+# CHANGE to the directory containing the trimmed unzipped fastq files.
+path <- "/../../projects/gmgi/ecosystem-diversity/ossininglakes/Re-Run_2026/2022/cutadapt"
+
+#check all files are in the path
+list.files(path)
+
+```
+
+dada2
+```{r}
+# Forward and reverse fastq file names have format: SAMPLENAME_R1_trimmed.fastq and SAMPLENAME_R2_trimmed.fastq
+fnFs <- sort(list.files(path, pattern="_R1_trimmed.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_trimmed.fastq.gz", full.names = TRUE))
+
+# Extract sample names, assuming file names have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+
+# visualize the quality profiles of the forward reads (note where to truncate)
+jpeg("fnFsQuality16S2022_trim.jpg",width = 20, height =17, units = "in", res = 300)
+plotQualityProfile(fnFs[1:29])
+#truncate at 200
+
+# visualize the quality profiles of the reverse reads (note where to truncate)
+jpeg("fnRsQuality16S2022_trim.jpg",width = 20, height =17, units = "in", res = 300)
+plotQualityProfile(fnRs[1:29])
+#truncate at 140
+
+# Filter and trim
+# Place filtered files in filtered subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+# trim using standard filtering parameters: maxN=0 (DADA2 requires no Ns), truncQ=2, rm.phix=TRUE and maxEE=2. The maxEE parameter sets the maximum number of “expected errors” allowed in a read --> truncLen dependent on quality # On Windows set multithread=FALSE
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(200,140), maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE, compress=TRUE, multithread=FALSE) 
+head(out)
+
+# learn error rates
+errF <- learnErrors(filtFs, multithread=5)
+errR <- learnErrors(filtRs, multithread=5)
+
+# plot error rates (should be similar to theoretical)
+jpeg("errF16S2022_trim.jpg",width = 10, height =8, units = "in", res = 300)
+plotErrors(errF, nominalQ=TRUE)
+jpeg("errR16S2022_trim.jpg",width = 10, height =8, units = "in", res = 300)
+plotErrors(errR, nominalQ=TRUE)
+
+# apply the core sample inference algorithm to forward and reverse reads
+dadaFs <- dada(filtFs, err=errF, multithread=5)
+dadaRs <- dada(filtRs, err=errR, multithread=5)
+
+#Inspecting the returned dada-class object
+dadaFs[[1]]
+
+# merge paired reads
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+
+# build sequence table
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+
+# remove chimeras
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=5, verbose=TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+
+# check number of reads that made it through the pipeline #many samples
+getN <- function(x) sum(getUniques(x))
+# for multiple samples:
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim)) 
+# single sample: If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+##track <- cbind(out, getN(dadaFs), getN(dadaRs), getN(mergers), rowSums(seqtab.nochim)) 
+
+# check
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+# assign taxonomy
+taxa <- assignTaxonomy(seqtab.nochim, "/../../projects/gmgi/databases/16S/CyanoSeq_1.2_SILVA138.1_dada2.fastq.gz", multithread=5)
+taxa <- addSpecies(taxa, "/../../projects/gmgi/databases/16S/silva-138.1/silva_species_assignment_v138.1.fa.gz")
+
+# inspect taxonomic assignments
+taxa.print <- taxa #Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+
+# merge taxonomy and counts
+asv_seqs <- colnames(seqtab.nochim)
+asv_headers <- vector(dim(seqtab.nochim)[2], mode="character")
+
+# fasta header as ASV_
+for (i in 1:dim(seqtab.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+# ASV sequences
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+
+# ASV abundance
+asv_otu <- t(seqtab.nochim)
+row.names(asv_otu) <- sub(">", "", asv_headers)
+
+# ASV taxonomy
+asv_tax <- taxa
+row.names(asv_tax) <- sub(">", "", asv_headers)
+
+# merging abundance and tax table
+OTU_TAX_table <- merge(asv_otu, asv_tax, by=0)
+
+# writing output files and saving to server
+write(asv_fasta, "/../../projects/gmgi/ecosystem-diversity/ossininglakes/Re-Run_2026/2022/dada2/asv_fasta_rl.fa")
+write.table(asv_otu, "/../../projects/gmgi/ecosystem-diversity/ossininglakes/Re-Run_2026/2022/dada2/asv_otu_rl.csv", sep=",", quote=F, col.names=NA)
+write.table(asv_tax, "/../../projects/gmgi/ecosystem-diversity/ossininglakes/Re-Run_2026/2022/dada2/asv_tax_rl.csv", sep=",", quote=F, col.names=NA)
+write.table(OTU_TAX_table, "/../../projects/gmgi/ecosystem-diversity/ossininglakes/Re-Run_2026/2022/dada2/OTU_TAX_table_rl.csv", sep=",", quote=F, col.names=NA)
+```
+
+phyloseq (post dada2)
+```{r}
+#phyloseq object creation
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               tax_table(taxa))
+ps
+
+#richness (alpha diversity)
+jpeg("richness16S2022_trim.jpg",width = 10, height =8, units = "in", res = 300)
+plot_richness(ps, measures=c("Observed"))
+
+#ordinate
+ps.prop <- transform_sample_counts(ps, function(otu) otu/sum(otu))
+ord.nmds.bray <- ordinate(ps.prop, method="NMDS", distance="bray")
+#jpeg("ordination16S2022_trim.jpg",width = 10, height =8, units = "in", res = 300)
+#plot_ordination(ps.prop, ord.nmds.bray, color= , title="Bray NMDS")
+
+# NMDS
+os.ord <- ordinate(ps, "NMDS", "bray")
+
+
+#Bar plot
+top20 <- names(sort(taxa_sums(ps), decreasing=TRUE))[1:30]
+ps.top20 <- transform_sample_counts(ps, function(OTU) OTU/sum(OTU))
+ps.top20 <- prune_taxa(top20, ps.top20)
+jpeg("barplot16S2022_trim.jpg",width = 14, height =8, units = "in", res = 300)
+plot_bar(ps, fill="Phylum")
+```

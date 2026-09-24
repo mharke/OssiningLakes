@@ -1,0 +1,2122 @@
+---
+title: "Interdomain (16S x 18S) Co-occurrence Network Analysis with Cyanobacteria/HAB Focus"
+subtitle: "Ossining 2023 lake microbiome data set"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,        # show all code, for reproducibility/review
+  eval = FALSE,       # Off by default: SpiecEasi/NetCoMi are GitHub-only
+                       # (not on CRAN) and this Rmd's network construction is
+                       # long-running. Data paths below are correct and point
+                       # at data/ and results/ (run the curation scripts and
+                       # the two Diversity Rmds first). Set eval = TRUE (or
+                       # per-chunk) once SpiecEasi/NetCoMi are installed and
+                       # you're ready to run the full pipeline.
+  warning = TRUE,
+  message = TRUE
+)
+```
+
+# 0. Packages and color palette
+
+```{r packages}
+# Guarded loader: check availability before library() rather than assuming
+# it - consistent with the defensive style already used elsewhere in this
+# pipeline (column-name / date-format checks below), extended to packages.
+required_pkgs <- c("SpiecEasi", "NetCoMi", "vegan", "ggplot2")
+missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace,
+                                       logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop("Required package(s) not installed: ", paste(missing_pkgs, collapse = ", "),
+       ". Install SpiecEasi/NetCoMi from GitHub (zdk123/SpiecEasi, ",
+       "stefpeschel/NetCoMi) and vegan/ggplot2 from CRAN before proceeding. ",
+       "Not proceeding with an unverified environment.")
+}
+
+library(SpiecEasi)   # cross-domain compositional association estimation
+library(NetCoMi)     # network construction, analysis, comparison
+library(vegan)       # Mantel test, Bray-Curtis dissimilarity
+library(ggplot2)      # Section 9c completeness heatmap only
+library(patchwork)   # combine per-taxon ggplot2 panels into one figure per lake
+library(circlize)
+
+set.seed(123456)      # reproducibility of SpiecEasi/pulsar and clustering
+
+# Colorblind-safe palette (Okabe & Ito 2008) used throughout for node coloring
+COL_16S_OTHER <- "#56B4E9"  # blue      = non-cyanobacterial 16S (Bacteria)
+COL_CYANO     <- "#D55E00"  # vermilion = Cyanobacteria (16S)
+COL_18S       <- "#009E73"  # green     = 18S micro-eukaryotes
+
+# NetCoMi's default edge coloring (green = positive, red = negative) is NOT
+# colorblind-safe - red/green is the worst pair for the most common form of
+# color blindness. Overridden via NetCoMi's documented posCol/negCol.
+COL_EDGE_POS <- "#0072B2"   # blue   = positive association (co-occurrence)
+COL_EDGE_NEG <- "#E69F00"   # orange = negative association (mutual exclusion)
+```
+
+# 1. Load data
+
+All rows and columns of the uploaded 2023_16S.csv, 2023_18S.csv, and
+ossining_meta.csv are read in unmodified here; no subsetting happens until
+the explicitly-flagged steps below (organelle/host filtering, per-lake
+prevalence filtering), each of which reports exactly what and how much it
+removes.
+
+```{r load-data}
+counts_16S <- read.csv("results/2023_16S.csv", stringsAsFactors = FALSE, check.names = FALSE)
+counts_18S <- read.csv("results/2023_18S.csv", stringsAsFactors = FALSE, check.names = FALSE)
+meta_all   <- read.csv("data/ossining_meta.csv", stringsAsFactors = FALSE, check.names = FALSE)
+
+# Restrict metadata to samples with a matching 2023 sequencing sample.
+# (Removes 2022 metadata rows only - does not remove any ASV data.)
+meta <- meta_all[meta_all$Year == 2023, ]
+meta$SampleShort <- sub("-23$", "", meta$SampleID)   # "LM-6-1-23" -> "LM-6-1"
+
+env_vars_all <- c("Stemp", "Btemp", "SpH", "BpH", "SDO", "BDO", "MC", "NO3", "PO4", "N:P")
+lake_lookup  <- c(LM = "Lake Mohegan", LR = "Lake Rippowam", TTL = "Teatown Lake")
+```
+
+# 2. Remove non-target (organelle/host) sequences from 16S data
+
+16S universal bacterial/archaeal primers routinely co-amplify chloroplast
+and mitochondrial rRNA genes, and can occasionally pick up misclassified
+host/eukaryotic sequences. Removing these prior to analysis is standard
+practice for 16S community data (see e.g. the QIIME2/DADA2 taxonomy-based
+filtering tutorials; Bokulich et al. 2018, *mSystems*). This runs before
+Section 3's Taxa-level aggregation and Cyanobacteria detection, because
+chloroplasts are phylogenetically nested within Cyanobacteria in most
+reference taxonomies (SILVA, GTDB) and typically labeled `Phylum =
+Cyanobacteriota, Class = Chloroplast` -- if not removed first, chloroplast
+reads would be miscounted as genuine Cyanobacteria in Section 3.
+
+Filter criteria: `Class == "Chloroplast"`, `Family == "Mitochondria"`,
+`Kingdom == "Eukaryota"`.
+
+```{r organelle-filter}
+# Confirm required columns exist before filtering - do not assume they do
+required_cols <- c("Class", "Family", "Kingdom")
+missing_cols <- setdiff(required_cols, names(counts_16S))
+if (length(missing_cols) > 0) {
+  stop("2023_16S.csv is missing required column(s) for organelle/host filtering: ",
+       paste(missing_cols, collapse = ", "),
+       ". Not proceeding until columns are confirmed present.")
+}
+
+# NA-safe: NA in Class/Family/Kingdom is treated as "not matching" rather
+# than propagating NA into the logical index
+is_chloroplast  <- !is.na(counts_16S$Class)   & counts_16S$Class   == "Chloroplast"
+is_mitochondria <- !is.na(counts_16S$Family)  & counts_16S$Family  == "Mitochondria"
+is_eukaryota    <- !is.na(counts_16S$Kingdom) & counts_16S$Kingdom == "Eukaryota"
+remove_idx <- is_chloroplast | is_mitochondria | is_eukaryota
+
+sample_cols_16S_raw <- grep("^16S-", names(counts_16S), value = TRUE)
+n_asv_removed   <- sum(remove_idx)
+n_reads_removed <- sum(as.matrix(counts_16S[remove_idx, sample_cols_16S_raw, drop = FALSE]))
+n_reads_total   <- sum(as.matrix(counts_16S[, sample_cols_16S_raw, drop = FALSE]))
+
+cat("\n=== 16S organelle/host sequence filtering ===\n")
+cat("ASVs removed - Chloroplast (Class):", sum(is_chloroplast), "\n")
+cat("ASVs removed - Mitochondria (Family):", sum(is_mitochondria), "\n")
+cat("ASVs removed - Eukaryota (Kingdom):", sum(is_eukaryota), "\n")
+cat("Total ASVs removed:", n_asv_removed, "of", nrow(counts_16S),
+    "(", round(100 * n_asv_removed / nrow(counts_16S), 1), "%)\n")
+cat("Total reads removed:", n_reads_removed, "of", n_reads_total,
+    "(", round(100 * n_reads_removed / n_reads_total, 1), "%)\n")
+
+# Full audit trail - nothing discarded without a record of exactly what/why
+write.csv(counts_16S[remove_idx, ],
+          "results/16S_removed_chloroplast_mitochondria_eukaryota.csv", row.names = FALSE)
+
+# Apply the filter - all downstream 16S steps use this filtered object
+counts_16S <- counts_16S[!remove_idx, ]
+```
+
+# 3. Aggregate ASV counts to the "Taxa" column; identify Cyanobacteria and HAB genera
+
+```{r aggregate-taxa}
+aggregate_to_taxa <- function(df, sample_cols, taxa_col, higher_col) {
+  taxa_label <- df[[taxa_col]]
+  taxa_label[is.na(taxa_label) | taxa_label %in% c("NA", "")] <- "Unclassified"
+  count_mat <- as.matrix(df[, sample_cols])
+  agg <- rowsum(count_mat, group = taxa_label)   # sum ASV counts within each Taxa label
+
+  # Most common higher-rank label per Taxa entry, for node coloring /
+  # Cyanobacteria identification
+  higher_lookup <- tapply(df[[higher_col]], taxa_label,
+                           function(x) names(sort(table(x), decreasing = TRUE))[1])
+  list(counts = agg, higher = higher_lookup[rownames(agg)])
+}
+
+sample_cols_16S <- grep("^16S-", names(counts_16S), value = TRUE)
+sample_cols_18S <- grep("^18S-", names(counts_18S), value = TRUE)
+
+taxa_16S <- aggregate_to_taxa(counts_16S, sample_cols_16S, "Taxa", "Phylum")
+taxa_18S <- aggregate_to_taxa(counts_18S, sample_cols_18S, "Taxa", "Division")
+
+# This data set labels the cyanobacterial phylum "Cyanobacteriota" (GTDB-style
+# nomenclature), not "Cyanobacteria" - verified directly in the data (do not
+# assume nomenclature; confirm it in the object being used).
+cyano_taxa <- rownames(taxa_16S$counts)[taxa_16S$higher == "Cyanobacteriota"]
+cat("Cyanobacteria taxa detected (16S, Phylum = 'Cyanobacteriota'):\n")
+print(cyano_taxa)
+```
+
+```{r hab-list}
+# User-specified HAB-forming (harmful algal bloom) genera. This list is
+# NOT cross-checked against external nomenclature databases, and - as
+# flagged below - is not guaranteed to be a subset of cyano_taxa above,
+# which matters for the Section 9 completeness-matrix fix (stage 3a).
+HAB_TAXA <- c("Aliinostoc", "Aphanizomenon", "Cephalothrix", "Chrysosporum",
+              "Cuspidothrix", "Cyanobium", "Desikacharya", "Dolichospermum",
+              "Geitlerinema", "Lacustricoccus", "Leptolyngbya", "Limnococcus",
+              "Limnothrix", "Marileptolyngbya", "Microcystis", "Nodosilinea",
+              "Planktothrix", "Pseudoanabaena", "Radiocystis", "Raphidiopsis",
+              "Regnicoccus", "Vulcanococcus", "Woronichinia")
+
+HAB_detected <- intersect(HAB_TAXA, rownames(taxa_16S$counts))
+HAB_absent   <- setdiff(HAB_TAXA, rownames(taxa_16S$counts))
+
+# FIXED (Rmd review, bug #2 setup): explicitly report which detected HAB
+# genera are NOT labeled Phylum = Cyanobacteriota in this taxonomy, since
+# those genera will be silently excluded from Section 7's correlation
+# testing set - this warning makes that fact visible up front rather than
+# only showing up as an unexplained gap in Section 9.
+HAB_detected_not_cyano <- setdiff(HAB_detected, cyano_taxa)
+if (length(HAB_detected_not_cyano) > 0) {
+  message("HAB-list genera detected in the data but NOT labeled Phylum = ",
+          "'Cyanobacteriota' in this taxonomy (will be excluded from Section 7's ",
+          "environmental-correlation testing set, and flagged as stage 3a rather ",
+          "than stage 3 in Section 9): ", paste(HAB_detected_not_cyano, collapse = ", "))
+}
+
+cat("\nUser-specified HAB-forming genera FOUND in 'Taxa' column of 2023_16S.csv ",
+    "(pooled across all lakes, before prevalence filtering):\n")
+print(HAB_detected)
+if (length(HAB_absent) > 0) {
+  message("HAB-list genera NOT found anywhere in this dataset's 'Taxa' column ",
+          "(absent from these lakes/samples, or spelled/classified differently ",
+          "in this taxonomy - not verified against external nomenclature): ",
+          paste(HAB_absent, collapse = ", "))
+}
+```
+
+# 4. Per-lake data prep: sample matching, prevalence filtering
+
+```{r prevalence-filter}
+min_prevalence <- 0.20   # ADJUSTABLE - not a universal standard (see Results outline 5.3)
+
+filter_prevalence <- function(mat, min_frac) {
+  n <- ncol(mat)
+  min_samp <- ceiling(min_frac * n)
+  keep <- rowSums(mat > 0) >= min_samp
+  mat[keep, , drop = FALSE]
+}
+
+lake_data <- list()
+
+for (code in names(lake_lookup)) {
+
+  samp16 <- grep(paste0("^16S-", code, "-"), sample_cols_16S, value = TRUE)
+  samp18 <- grep(paste0("^18S-", code, "-"), sample_cols_18S, value = TRUE)
+  short16 <- sub("^16S-", "", samp16)
+  short18 <- sub("^18S-", "", samp18)
+
+  common <- Reduce(intersect, list(short16, short18,
+                                    meta$SampleShort[meta$Lake == lake_lookup[code]]))
+  common <- sort(common)
+
+  m16 <- taxa_16S$counts[, paste0("16S-", common), drop = FALSE]
+  m18 <- taxa_18S$counts[, paste0("18S-", common), drop = FALSE]
+
+  m16_filt <- filter_prevalence(m16, min_prevalence)
+  m18_filt <- filter_prevalence(m18, min_prevalence)
+
+  dropped_cyano <- setdiff(cyano_taxa, rownames(m16_filt))
+  if (length(dropped_cyano) > 0) {
+    message("Lake ", code, ": Cyanobacteria taxa removed by the ", min_prevalence * 100,
+            "% prevalence filter (present in too few samples): ",
+            paste(dropped_cyano, collapse = ", "))
+  }
+
+  lake_data[[code]] <- list(samples = common, m16 = m16_filt, m18 = m18_filt)
+
+  cat("Lake", code, "-", length(common), "paired 16S/18S samples;",
+      nrow(m16_filt), "16S taxa and", nrow(m18_filt), "18S taxa retained\n")
+}
+```
+
+# 5. Cross-domain network per lake (SpiecEasi -> NetCoMi)
+
+Parameters and function calls below (`multi.spiec.easi`, `symBeta`,
+`getOptBeta`, `getOptInd`, `getRefit`, `getStability`, `netConstruct`,
+`netAnalyze`) match NetCoMi's own documented cross-domain-networks vignette
+and SpiecEasi's cross-domain vignette usage.
+
+```{r networks}
+# =====================================================================
+# Section 5 replacement: "Cross-domain network per lake (SpiecEasi ->
+# NetCoMi)". Only the PLOTTING block at the end changes (everything above
+# it - multi.spiec.easi fitting, StARS boundary diagnostics, netConstruct/
+# netAnalyze, lake_results assembly - is UNCHANGED from the original).
+#
+# CHANGES:
+#   - Node labels are now numbers (1..N per lake, alphabetical), passed
+#     via plot.microNetProps()'s documented `labels` argument (a named
+#     character vector keyed to the adjacency matrix's row/column names -
+#     confirmed in NetCoMi's own reference docs, not assumed) instead of
+#     the taxon names or the previous "hide labels via cexLabels~0"
+#     workaround.
+#   - The plot is now saved as an SVG (it previously was not saved to
+#     disk at all - only rendered inline in the knitted document).
+#   - A per-node lookup table is exported per lake and combined across
+#     lakes: Number, Taxon, Domain, is_HAB, raw edge count (Degree),
+#     mean/max |asso| across that taxon's own edges, NetCoMi's own
+#     centrality measures (degree/betweenness/closeness/eigenvector), and
+#     hub-taxon status (props$hubs, via the same get_hub_taxa() extraction
+#     pattern used in Section 7 v3 - duplicated here since Section 5 runs
+#     BEFORE Section 7 in this Rmd and cannot depend on it having already
+#     defined that helper).
+# =====================================================================
+
+# Duplicated from Section 7 v3 (see that chunk's comment) - kept identical
+# in both places intentionally, so Section 5 doesn't depend on chunk
+# execution order. If you consolidate this into a single shared setup
+# chunk later, remove one of the two copies, not both independently.
+get_hub_taxa <- function(props) {
+  hubs <- props$hubs
+  hub_names <- if (!is.null(hubs$hubs1)) hubs$hubs1 else hubs   # verify against str(props$hubs) if this ever errors
+  as.character(hub_names)
+}
+
+lake_results <- list()
+full_network_tables <- list()
+
+for (code in names(lake_data)) {
+
+  d <- lake_data[[code]]
+
+  m16_t <- t(d$m16)
+  m18_t <- t(d$m18)
+  rownames(m16_t) <- d$samples
+  rownames(m18_t) <- d$samples
+  stopifnot(identical(rownames(m16_t), rownames(m18_t)))
+
+  nlambda_val <- 30
+  lambda_min_ratio_val <- 1e-2
+
+  se_fit <- SpiecEasi::multi.spiec.easi(
+    list(m16_t, m18_t),
+    method = "mb",
+    nlambda = nlambda_val,
+    lambda.min.ratio = lambda_min_ratio_val,
+    pulsar.params = list(thresh = 0.05, rep.num = 50)
+  )
+
+  assoMat <- as.matrix(SpiecEasi::symBeta(SpiecEasi::getOptBeta(se_fit), mode = "ave"))
+  taxa_names <- c(rownames(d$m16), rownames(d$m18))
+  colnames(assoMat) <- rownames(assoMat) <- taxa_names
+  diag(assoMat) <- 1
+
+  opt_idx <- SpiecEasi::getOptInd(se_fit)
+  at_boundary <- opt_idx %in% c(1, nlambda_val)
+  n_edges <- sum(as.matrix(SpiecEasi::getRefit(se_fit))) / 2
+  n_possible <- choose(length(taxa_names), 2)
+  cat("\nLake", code, "- network diagnostics:\n")
+  cat("  Taxa (nodes):", length(taxa_names), "| Samples:", nrow(m16_t), "\n")
+  cat("  Edges:", n_edges, "/", n_possible, "possible (density =",
+      round(n_edges / n_possible, 3), ")\n")
+  cat("  StARS stability at selected lambda:", round(SpiecEasi::getStability(se_fit), 3),
+      "(target = pulsar.params$thresh = 0.05)\n")
+  if (at_boundary) {
+    warning("Lake ", code, ": StARS selected the lambda path BOUNDARY (index ", opt_idx,
+            " of ", nlambda_val, "). Widen the path (increase nlambda / decrease ",
+            "lambda.min.ratio) and re-run before trusting this network's density.")
+  }
+
+  net   <- NetCoMi::netConstruct(data = assoMat, dataType = "condDependence", sparsMethod = "none")
+  props <- NetCoMi::netAnalyze(net, hubPar = "eigenvector", clustMethod = "cluster_fast_greedy")
+
+  edge_w <- abs(net$edgelist1$asso)
+  cat("  Edge-weight (|association|) distribution, n =", length(edge_w), "edges:\n")
+  print(round(quantile(edge_w, probs = c(0, .25, .5, .75, .9, .95, 1)), 3))
+
+  domain_vec <- setNames(c(rep("16S", nrow(d$m16)), rep("18S", nrow(d$m18))), taxa_names)
+  is_cyano <- taxa_names %in% cyano_taxa
+  nodeCols <- setNames(
+    ifelse(is_cyano, COL_CYANO, ifelse(domain_vec == "16S", COL_16S_OTHER, COL_18S)),
+    taxa_names
+  )
+
+  lake_results[[code]] <- list(assoMat = assoMat, taxa = taxa_names, domain = domain_vec,
+                                net = net, props = props, nodeCols = nodeCols, edge_w = edge_w,
+                                m16 = d$m16, m18 = d$m18, samples = d$samples)
+
+  # ---- Number labels: alphabetical, 1..N, keyed to taxa_names so the
+  # named vector's names match assoMat's row/column names exactly, as
+  # plot.microNetProps()'s `labels` argument requires. ----
+  node_number <- setNames(seq_along(sort(taxa_names)), sort(taxa_names))
+  label_vec <- setNames(as.character(node_number[taxa_names]), taxa_names)
+
+  render_full_network_plot <- function() {
+    plot(props, nodeColor = "colorVec", colorVec = nodeCols,
+         nodeSize = "eigenvector", nodeSizeSpread = 3,
+         labels = label_vec, labelScale = FALSE, cexLabels = 0.01,
+         rmSingles = "all", edgeFilter = "none",
+         posCol = COL_EDGE_POS, negCol = COL_EDGE_NEG,
+         title1 = lake_lookup[code], showTitle = TRUE, cexTitle = 1.4)
+    legend(-1.6, -1.1, cex = 0.7, pt.cex = 1.3,
+           legend = c("Other Bacteria (16S)", "Cyanobacteria (16S)", "Micro-eukaryotes (18S)",
+                      "+ association", "- association"),
+           col = c(COL_16S_OTHER, COL_CYANO, COL_18S, COL_EDGE_POS, COL_EDGE_NEG),
+           pch = c(16, 16, 16, NA, NA), lty = c(NA, NA, NA, 1, 1), lwd = 2, bty = "n", xpd = TRUE)
+  }
+
+  svg(paste0("results/full_network_", code, ".svg"), width = 12, height = 10)
+  render_full_network_plot()
+  dev.off()
+
+  render_full_network_plot()   # on-screen / knitted-document copy
+
+  # ---- Per-node lookup table: number, taxonomy, degree, association
+  # summary, centrality, and hub status. ----
+  edges <- net$edgelist1
+  cent  <- props$centralities
+  hub_taxa_lake <- get_hub_taxa(props)
+
+  node_stats <- lapply(taxa_names, function(tx) {
+    touch <- edges$v1 == tx | edges$v2 == tx
+    n_edge <- sum(touch)
+    abs_asso_tx <- abs(edges$asso[touch])
+    data.frame(
+      Lake = lake_lookup[code],
+      Number = node_number[[tx]],
+      Taxon = tx,
+      Domain = domain_vec[[tx]],
+      is_HAB = tx %in% HAB_TAXA,
+      is_hub_taxon = tx %in% hub_taxa_lake,
+      Degree = n_edge,
+      Plotted_in_figure = n_edge > 0,   # rmSingles = "all" drops degree-0 nodes from the SVG
+      Mean_abs_asso = if (n_edge > 0) mean(abs_asso_tx) else NA_real_,
+      Max_abs_asso  = if (n_edge > 0) max(abs_asso_tx)  else NA_real_,
+      Degree_centrality_norm      = unname(cent$degree1[tx]),
+      Betweenness_centrality_norm = unname(cent$between1[tx]),
+      Closeness_centrality_norm   = unname(cent$close1[tx]),
+      Eigenvector_centrality_norm = unname(cent$eigenv1[tx]),
+      stringsAsFactors = FALSE
+    )
+  })
+  full_network_tables[[code]] <- do.call(rbind, node_stats)
+
+  write.csv(full_network_tables[[code]][order(full_network_tables[[code]]$Number), ],
+            paste0("results/full_network_taxon_reference_", code, ".csv"), row.names = FALSE)
+}
+
+full_network_table_all <- do.call(rbind, full_network_tables)
+full_network_table_all <- full_network_table_all[order(full_network_table_all$Lake,
+                                                          full_network_table_all$Number), ]
+write.csv(full_network_table_all, "results/full_network_taxon_reference_all_lakes.csv", row.names = FALSE)
+cat("\n=== Full-network per-node reference table, all lakes (also written to CSV) ===\n")
+print(head(full_network_table_all, 20))
+```
+
+# 6. Cyanobacteria-centered edge extraction (biotic co-occurrence)
+
+```{r cyano-edges}
+cyano_edge_summary <- list()
+
+for (code in names(lake_results)) {
+  r <- lake_results[[code]]
+  edges <- r$net$edgelist1   # columns: v1, v2, asso (netConstruct() docs)
+
+  cyano_edges <- edges[edges$v1 %in% cyano_taxa | edges$v2 %in% cyano_taxa, ]
+  cyano_edges$partner_domain <- ifelse(cyano_edges$v1 %in% cyano_taxa,
+                                        r$domain[cyano_edges$v2], r$domain[cyano_edges$v1])
+  cyano_edges$is_HAB <- (cyano_edges$v1 %in% HAB_TAXA) | (cyano_edges$v2 %in% HAB_TAXA)
+  cyano_edges$lake <- lake_lookup[code]
+  cyano_edge_summary[[code]] <- cyano_edges
+
+  cat("\nLake", code, "- Cyanobacteria co-occurrence edges:", nrow(cyano_edges),
+      "( to 18S partners:", sum(cyano_edges$partner_domain == "18S"),
+      "; involving HAB-list genera:", sum(cyano_edges$is_HAB), ")\n")
+}
+
+cyano_edges_all <- do.call(rbind, cyano_edge_summary)
+write.csv(cyano_edges_all, "results/cyanobacteria_cooccurrence_edges_by_lake.csv", row.names = FALSE)
+
+# HAB-specific edges, strongest |association| first
+hab_edges_all <- cyano_edges_all[cyano_edges_all$is_HAB, ]
+hab_edges_all <- hab_edges_all[order(-abs(hab_edges_all$asso)), ]
+cat("\n=== HAB-list genus co-occurrence edges (all lakes, strongest first) ===\n")
+print(head(hab_edges_all, 20))
+```
+
+```{r rank hab}
+# =====================================================================
+# 7a. Rank HAB genera by abundance within Cyanobacteria (matches Figure 6)
+#
+# ADDED - previously referenced by Section 8/8a ("top_hab_by_abundance",
+# "TOP_N_ABUNDANT") but never defined anywhere in this Rmd, which is what
+# produced "Error: object 'top_hab_by_abundance' not found".
+#
+# Per confirmed definition:
+#   - Abundance basis: each genus's reads / TOTAL CYANOBACTERIA reads in
+#     that sample (relative abundance WITHIN Cyanobacteria, not within
+#     total 16S or total 16S+18S community) - matches how Figure 6 is
+#     described as being constructed (2023_16S_ReAnalyzed_Diversity.Rmd).
+#   - Ranking pool: HAB_TAXA genera that are ALSO classified Cyanobacteriota
+#     in this taxonomy (cyano_taxa) - a HAB-list genus not in cyano_taxa
+#     has no defined "% of Cyanobacteria reads" (already flagged separately
+#     as HAB_detected_not_cyano in Section 3).
+#   - TOP_N_ABUNDANT = 5, per confirmation.
+#   - Uses lake_data[[code]]$m16 - the POST-prevalence-filter matrix
+#     (Section 4), i.e. the same filtered counts every other per-lake step
+#     in this pipeline uses, not the unfiltered taxa_16S$counts.
+# =====================================================================
+
+TOP_N_ABUNDANT <- 5   # top N HAB genera per lake, by mean %-of-Cyanobacteria abundance
+
+top_hab_by_abundance <- list()
+
+for (code in names(lake_data)) {
+  m16 <- lake_data[[code]]$m16
+  cyano_in_lake     <- intersect(cyano_taxa, rownames(m16))
+  hab_cyano_in_lake <- intersect(HAB_TAXA, cyano_in_lake)
+
+  if (length(cyano_in_lake) == 0 || length(hab_cyano_in_lake) == 0) {
+    message("Lake ", code, ": no HAB-list genera classified as Cyanobacteriota and present ",
+            "after prevalence filtering - top_hab_by_abundance[['", code, "']] set to ",
+            "character(0), so Section 8/8a will skip this lake rather than error.")
+    top_hab_by_abundance[[code]] <- character(0)
+    next
+  }
+
+  # Relative abundance WITHIN Cyanobacteria: genus reads / total
+  # Cyanobacteria reads, per sample (NOT total 16S, NOT total community).
+  cyano_counts <- m16[cyano_in_lake, , drop = FALSE]
+  cyano_totals_per_sample <- colSums(cyano_counts)
+
+  if (any(cyano_totals_per_sample == 0)) {
+    zero_samples <- names(cyano_totals_per_sample)[cyano_totals_per_sample == 0]
+    message("Lake ", code, ": sample(s) with ZERO total Cyanobacteria reads after ",
+            "prevalence filtering (", paste(zero_samples, collapse = ", "), ") - excluded from ",
+            "this lake's mean relative-abundance calculation to avoid division by zero.")
+  }
+  valid_samples <- names(cyano_totals_per_sample)[cyano_totals_per_sample > 0]
+
+  cyano_rel_within <- sweep(cyano_counts[, valid_samples, drop = FALSE], 2,
+                            cyano_totals_per_sample[valid_samples], "/")
+
+  mean_rel_abund <- rowMeans(cyano_rel_within[hab_cyano_in_lake, , drop = FALSE])
+  ranked <- sort(mean_rel_abund, decreasing = TRUE)
+
+  n_take <- min(TOP_N_ABUNDANT, length(ranked))
+  if (n_take < TOP_N_ABUNDANT) {
+    message("Lake ", code, ": only ", n_take, " HAB-list Cyanobacteria genus/genera available ",
+            "(fewer than TOP_N_ABUNDANT = ", TOP_N_ABUNDANT, ") - using all of them.")
+  }
+  top_hab_by_abundance[[code]] <- names(ranked)[seq_len(n_take)]
+
+  cat("Lake", code, "- top", n_take, "HAB genera by mean % of Cyanobacteria reads:\n")
+  print(round(ranked[seq_len(n_take)] * 100, 2))
+}
+```
+
+# 7. HAB-focused ego-network + numbered plot with lookup table
+
+```{r hab-subnetwork}
+# 16S Phylum colors - hex values read directly from Figure 5's legend swatches
+# (pixel-sampled, median RGB per swatch -> hex). Source: colorRampPalette(brewer.pal(12,
+# "Paired"))(41) applied to sort(unique(Phylum)), per 2023_16S_ReAnalyzed_Diversity.Rmd.
+# R was not available in the review environment to re-run colorRampPalette and confirm
+# its exact interpolation, so these are read from the rendered figure itself rather than
+# recomputed - the authoritative source either way, since it's what the manuscript figure
+# actually shows. 41 entries = 41 phyla in the 2023 16S dataset (confirmed against Figure 5).
+PHYLUM_COLORS_16S <- c(
+  "Abditibacteriota" = "#A5CEE2",
+  "Acidobacteriota" = "#80B7D6",
+  "Actinobacteriota" = "#5B9EC9",
+  "Aenigmarchaeota" = "#3687BC",
+  "Armatimonadota" = "#2E82B0",
+  "Bacteroidota" = "#579EA4",
+  "Bdellovibrionota" = "#7EBA98",
+  "Calditrichota" = "#A7D78D",
+  "Campylobacterota" = "#97D276",
+  "Chloroflexi" = "#75C15D",
+  "Cloacimonadota" = "#52AF44",
+  "Crenarchaeota" = "#389E2E",
+  "Cyanobacteriota" = "#6F9E4D",
+  "Deferrisomatota" = "#A69C69",
+  "Deinococcota" = "#DD9A89",
+  "Dependentiae" = "#F88A89",
+  "Desulfobacterota" = "#F16767",
+  "Elusimicrobiota" = "#E94343",
+  "Euryarchaeota" = "#E42022",
+  "Fermentibacterota" = "#E93F2E",
+  "Fibrobacterota" = "#F06C45",
+  "Firmicutes" = "#F7995C",
+  "Fusobacteriota" = "#FDBA69",
+  "Gemmatimonadota" = "#FDAA4A",
+  "Halobacterota" = "#FE982C",
+  "Hydrogenedentes" = "#FE880D",
+  "Iainarchaeota" = "#F78620",
+  "Latescibacterota" = "#E9945B",
+  "Methylomirabilota" = "#DAA295",
+  "Micrarchaeota" = "#CBB0CF",
+  "Modulibacteria" = "#B294C6",
+  "Myxococcota" = "#9774B6",
+  "Nanoarchaeota" = "#7D53A5",
+  "Nitrospirota" = "#754A99",
+  "Patescibacteria" = "#9E8098",
+  "Planctomycetota" = "#C7B69A",
+  "Proteobacteria" = "#F0EB99",
+  "Spirochaetota" = "#F0E184",
+  "Sumerlaeota" = "#DBB465",
+  "Thermoplasmatota" = "#C68648",
+  "Verrucomicrobiota" = "#B15929"
+)
+
+# Cyanobacteria Taxa (genus-level) colors - read from Figure 6's legend swatches.
+# Source: colorRampPalette(brewer.pal(8, "Set1"))(19) applied to sort(unique(Taxa)) among
+# Cyanobacteriota ASVs with Abundance > 0.01 in at least one sample (2023_16S_ReAnalyzed_
+# Diversity.Rmd). NOTE: this 1%-abundance filter means some HAB_TAXA genera detected by the
+# interdomain network's 20%-PREVALENCE filter (a different criterion) may be ABSENT here -
+# handled explicitly below (get_node_color() warns and assigns a fallback gray, never a
+# guessed color, for any cyanobacteria taxon not in this list).
+CYANO_TAXA_COLORS_16S <- c(
+  "Aliinostoc" = "#E51A1D",
+  "Aphanizomenon" = "#AD394E",
+  "Aphanizomenonaceae_unclassified" = "#75597F",
+  "Caenarcaniphilales_unclassified" = "#3E7AB0",
+  "Cuspidothrix" = "#3D8A9A",
+  "Cyanobium" = "#449A77",
+  "Desikacharya" = "#4AAA53",
+  "Dolichospermum" = "#5E985E",
+  "Gastranaerophilales_unclassified" = "#757B7B",
+  "Geitlerinema" = "#8D5B96",
+  "Lacustricoccus" = "#A95684",
+  "Marileptolyngbya" = "#CB6750",
+  "Microcystis" = "#EC761E",
+  "Planktothrix" = "#FF8F05",
+  "Pseudanabaena" = "#FEB916",
+  "Raphidiopsis" = "#FFE127",
+  "Regnicoccus" = "#F6EE31",
+  "Vulcanococcus" = "#DAB92E",
+  "Woronichinia" = "#BD842A"
+)
+
+# 18S 'Taxa2' (edited division level) colors - read from Figure 7's legend swatches.
+# Source: colorRampPalette(brewer.pal(12, "Paired"))(43) applied to sort(unique(Taxa2))
+# (2023_18S_ReAnalyzed_Diversity.Rmd). IMPORTANT: keyed by 'Taxa2', NOT 'Division' - the
+# interdomain Rmd's Section 3 currently aggregates 18S taxa using the 'Division' column,
+# which the diversity Rmd's own comment describes as coarser than 'Taxa2' (e.g. Division
+# likely reads 'Opisthokonta' for ASVs that Taxa2 splits into 'Opisthokonta_Arthropoda',
+# 'Opisthokonta_Ascomycota', etc.). This code REQUIRES a 'Taxa2' column in counts_18S -
+# see the stopifnot() check below - specifically so it does not silently substitute the
+# coarser 'Division' scheme and produce colors that don't match Figure 7.
+DIVISION_COLORS_18S_TAXA2 <- c(
+  "Alveolata" = "#A6CEE3",
+  "Ancyromonadida" = "#82B7D6",
+  "Centroplasthelida" = "#5FA0CA",
+  "Chlorophyta" = "#3B8ABE",
+  "Collodictyonidae" = "#257CB2",
+  "Cryptophyta" = "#4C97A7",
+  "Discoba" = "#72B29C",
+  "Discosea" = "#99CD91",
+  "Evosea" = "#A5D981",
+  "Haptophyta" = "#84C868",
+  "Kathablepharidacea" = "#63B84F",
+  "Opisthokonta" = "#42A737",
+  "Opisthokonta_Annelida" = "#4F9F3B",
+  "Opisthokonta_Aphelidiomycota" = "#839D58",
+  "Opisthokonta_Arthropoda" = "#B89B74",
+  "Opisthokonta_Ascomycota" = "#EC9A91",
+  "Opisthokonta_Basidiomycota" = "#F68181",
+  "Opisthokonta_Blastocladiomycota" = "#F06060",
+  "Opisthokonta_Bryozoa" = "#E93E3F",
+  "Opisthokonta_Choanoflagellatea" = "#E31D1E",
+  "Opisthokonta_Chytridiomycota" = "#E9412F",
+  "Opisthokonta_Craniata" = "#F06C45",
+  "Opisthokonta_Gastrotricha" = "#F6975B",
+  "Opisthokonta_Ichthyophonida" = "#FDBD6C",
+  "Opisthokonta_Mollusca" = "#FDAC4F",
+  "Opisthokonta_Monoblepharomycota" = "#FE9B32",
+  "Opisthokonta_Mucoromycota" = "#FE8B15",
+  "Opisthokonta_Nematoda" = "#FB820F",
+  "Opisthokonta_Nucleariidea" = "#ED8F47",
+  "Opisthokonta_Opisthosporidia" = "#DF9D7F",
+  "Opisthokonta_Platyhelminthes" = "#D1AAB7",
+  "Opisthokonta_Pluriformea" = "#BEA4CE",
+  "Opisthokonta_Porifera" = "#A585BF",
+  "Opisthokonta_Rozellomycota" = "#8C66AF",
+  "Opisthokonta_Zoopagomycota" = "#73489F",
+  "Rhizaria" = "#825D99",
+  "Rhodophyta" = "#A99099",
+  "Rigifilida" = "#D0C299",
+  "Stramenopiles" = "#F7F599",
+  "Streptophyta" = "#EEDB80",
+  "Telonemia" = "#D9AF63",
+  "Tubulinea" = "#C58445",
+  "Verrucomicrobia" = "#B15928"
+)
+
+# =====================================================================
+# Section 7 replacement chunk, v3: `{r hab-subnetwork}`
+# CHANGED (per user request): node colors now match the diversity-analysis
+# bar plots (Figures 5-7) instead of the 3-way domain scheme (16S-other /
+# Cyanobacteria / 18S). Specifically:
+#   - 16S non-cyanobacteria nodes -> colored by Phylum (Figure 5's palette)
+#   - Cyanobacteria nodes         -> colored by Taxa/genus (Figure 6's palette)
+#   - 18S nodes                   -> colored by Taxa2 (Figure 7's palette)
+# A legend is added to the right of each circos plot listing every node
+# actually plotted, colored to match, with "(Phylum)"/"(Taxa2)" appended
+# to 16S/18S node names and cyanobacteria nodes left as their bare Taxa
+# name (per request - the color IS the taxon-level identifier for those).
+#
+# REQUIRES: PHYLUM_COLORS_16S, CYANO_TAXA_COLORS_16S, and
+# DIVISION_COLORS_18S_TAXA2 (color_lookup_tables.R) loaded before this chunk.
+# =====================================================================
+
+# ---- Load the three color lookup tables (see color_lookup_tables.R) ----
+# source("color_lookup_tables.R")   # UNCOMMENT once that file is in the same project
+
+# ---- Verify counts_18S carries the SAME 'Taxa2' column that produced
+# Figure 7 (NOT 'Division' - see explanation in color_lookup_tables.R
+# header). Fails loudly rather than silently falling back to the coarser
+# 'Division' field, which would give WRONG colors for every Opisthokonta_*
+# subgroup (they'd all collapse to whatever single color 'Opisthokonta'
+# happens to get under Division).
+if (!("Taxa2" %in% names(counts_18S))) {
+  stop("counts_18S (2023_18S.csv) has no 'Taxa2' column. Figure 7's colors are keyed to ",
+       "'Taxa2' (2023_18S_ReAnalyzed_Diversity.Rmd), which the diversity pipeline describes ",
+       "as an edited/finer version of 'Division' - NOT the same field currently used in ",
+       "Section 3 (aggregate_to_taxa(..., higher_col = \"Division\")). Add a 'Taxa2' column ",
+       "to 2023_18S.csv from the same source used in the diversity Rmd before proceeding - ",
+       "not falling back to 'Division' automatically, since that would silently produce ",
+       "colors that don't match Figure 7 for every Opisthokonta_* subgroup.")
+}
+
+# ---- Build a Taxa -> Taxa2 lookup (most common Taxa2 per aggregated Taxa
+# label), the same pattern aggregate_to_taxa() already uses for Division/
+# Phylum in Section 3 - added here as a second higher-rank lookup specific
+# to 18S, without altering Section 3's existing taxa_18S$higher (Division),
+# which other parts of the pipeline may still depend on.
+taxa2_lookup <- tapply(counts_18S$Taxa2, counts_18S$Taxa,
+                       function(x) names(sort(table(x), decreasing = TRUE))[1])
+
+#' Extract a scalar character value from a tapply()-built lookup vector.
+#' tapply() silently falls back to storing its result as a LIST-mode array
+#' (rather than a plain atomic vector) whenever its per-group function
+#' doesn't return a perfectly uniform scalar across every group - confirmed
+#' to be the actual case here for taxa_16S$higher (built in Section 3 of
+#' the interdomain Rmd) and taxa2_lookup (built above). In that mode,
+#' single-bracket `lookup_vec[key]` returns a one-element LIST instead of
+#' a bare string, which then fails with "invalid subscript type 'list'"
+#' if used directly as a subscript elsewhere - unlist() here flattens
+#' either representation (plain atomic OR list-mode) to a bare character
+#' value, and returns NA_character_ (never an error) if key isn't found.
+safe_lookup <- function(lookup_vec, key) {
+  raw <- lookup_vec[key]
+  val <- unlist(raw, use.names = FALSE)
+  if (length(val) == 0) return(NA_character_)
+  as.character(val)[1]
+}
+
+#' Resolve a node's plot color and legend label.
+#' - Cyanobacteria (in cyano_taxa): color from CYANO_TAXA_COLORS_16S, label = bare Taxa name.
+#' - 16S non-cyano: color from PHYLUM_COLORS_16S via taxa_16S$higher (Phylum), label = "Taxon (Phylum)".
+#' - 18S: color from DIVISION_COLORS_18S_TAXA2 via taxa2_lookup, label = "Taxon (Taxa2)".
+#' Never guesses: any taxon whose phylum/Taxa2 isn't in the corresponding
+#' color table gets FALLBACK_COLOR and is reported by name so it can be
+#' checked, rather than silently mis-colored.
+#'
+#' NOTE: PHYLUM_COLORS_16S / CYANO_TAXA_COLORS_16S / DIVISION_COLORS_18S_TAXA2
+#' are plain atomic vectors (built with c(...) in color_lookup_tables.R), so
+#' `[name]` + is.na() is safe for those. taxa_16S$higher and taxa2_lookup are
+#' tapply()-built and go through safe_lookup() instead - see its comment.
+FALLBACK_COLOR <- "grey60"
+
+resolve_node_color <- function(taxon, domain) {
+  if (taxon %in% cyano_taxa) {
+    col <- unname(CYANO_TAXA_COLORS_16S[taxon])
+    if (is.na(col)) {
+      message("No Figure-6 color for cyanobacteria taxon '", taxon, "' (likely below the ",
+              "diversity pipeline's 1%-abundance filter for that figure, despite passing this ",
+              "network's 20%-prevalence filter) - using fallback color.")
+      return(list(color = FALLBACK_COLOR, label = taxon))
+    }
+    return(list(color = col, label = taxon))
+  }
+  if (domain == "16S") {
+    phylum <- safe_lookup(taxa_16S$higher, taxon)
+    if (is.na(phylum)) {
+      message("No Phylum recorded for taxon '", taxon, "' in taxa_16S$higher - using fallback color.")
+      return(list(color = FALLBACK_COLOR, label = paste0(taxon, " (Unclassified)")))
+    }
+    col <- unname(PHYLUM_COLORS_16S[phylum])
+    if (is.na(col)) {
+      message("No Figure-5 color for phylum '", phylum, "' (taxon '", taxon, "') - ",
+              "using fallback color. Check whether this phylum was present in the diversity ",
+              "pipeline's 2023 16S dataset (Figure 5's source).")
+      return(list(color = FALLBACK_COLOR, label = paste0(taxon, " (", phylum, ")")))
+    }
+    return(list(color = col, label = paste0(taxon, " (", phylum, ")")))
+  }
+  # 18S
+  tx2 <- safe_lookup(taxa2_lookup, taxon)
+  if (is.na(tx2)) {
+    message("No Taxa2 recorded for taxon '", taxon, "' in taxa2_lookup - using fallback color.")
+    return(list(color = FALLBACK_COLOR, label = paste0(taxon, " (Unclassified)")))
+  }
+  col <- unname(DIVISION_COLORS_18S_TAXA2[tx2])
+  if (is.na(col)) {
+    message("No Figure-7 color for Taxa2 '", tx2, "' (taxon '", taxon, "') - ",
+            "using fallback color. Check whether this Taxa2 category was present in the ",
+            "diversity pipeline's 2023 18S dataset (Figure 7's source).")
+    return(list(color = FALLBACK_COLOR, label = paste0(taxon, " (", tx2, ")")))
+  }
+  list(color = col, label = paste0(taxon, " (", tx2, ")"))
+}
+
+neighbor_tables <- list()
+
+cat("Checking centrality structure for first lake (verify before trusting extraction):\n")
+str(lake_results[[1]]$props$centralities)
+
+TOP_N_PARTNERS <- 5   # ADJUSTABLE - number of strongest direct partners kept per HAB taxon
+
+LABEL_CEX_HAB    <- 0.8    # HAB-list anchor genera - larger, bold-ish (font=4)
+LABEL_CEX_PARTNER <- 0.55  # partner taxa - smaller, italic (font=3)
+LABEL_FONT_HAB    <- 4
+LABEL_FONT_PARTNER<- 3
+
+#' Return the top-N direct partners of one taxon by |asso|, from a lake's
+#' full edgelist. Never recomputes asso - reads directly from
+#' r$net$edgelist1, the same object Section 8's tornado plots use, so the
+#' ranking here always matches what's shown there.
+get_top_n_partners <- function(edges, taxon, n) {
+  touch <- edges$v1 == taxon | edges$v2 == taxon
+  sub <- edges[touch, ]
+  if (nrow(sub) == 0) return(character(0))
+  sub$partner <- ifelse(sub$v1 == taxon, sub$v2, sub$v1)
+  sub <- sub[order(-abs(sub$asso)), ]
+  head(sub$partner, n)
+}
+
+# CHANGED: hab_present and partner_taxa are computed ONCE per lake (in the
+# render loop below) and passed in. node_colors/node_labels (named
+# color/label per taxon, from resolve_node_color()) are also computed
+# once per lake and passed in, so the plotted nodes and the legend can
+# never disagree.
+plot_hab_subnetwork_circlize <- function(code, neighbor_set, hab_present, partner_taxa,
+                                          node_colors, node_labels) {
+  r <- lake_results[[code]]
+  edges_all <- r$net$edgelist1
+  edges <- edges_all[edges_all$v1 %in% neighbor_set & edges_all$v2 %in% neighbor_set, ]
+  node_order <- sort(neighbor_set)
+
+  # CHANGED (per request): the ring shows a NUMBER per node instead of the
+  # full taxon name - numbers are keyed to the right-side legend below, so
+  # the plot stays compact and readable even with 50-80 nodes. Numbering
+  # is 1..N in node_order (alphabetical), computed HERE from neighbor_set
+  # alone, so the ring and the legend always agree - it is never passed in
+  # separately, which would risk drifting out of sync if node_order's
+  # sort ever changed upstream.
+  node_number <- setNames(seq_along(node_order), node_order)
+
+  cent <- r$props$centralities
+  eig_vals <- tryCatch({
+    v <- cent$eigenv1[node_order]
+    if (any(is.na(v))) stop("NA after matching")
+    v
+  }, error = function(e) NULL)
+  node_cex <- if (is.null(eig_vals)) {
+    warning("Lake ", code, ": could not extract eigenvector centrality - using uniform size.")
+    setNames(rep(1, length(node_order)), node_order)
+  } else {
+    rng <- range(eig_vals)
+    if (diff(rng) > 0) setNames(0.5 + 1.5 * (eig_vals - rng[1]) / diff(rng), node_order)
+    else setNames(rep(1, length(node_order)), node_order)
+  }
+  # CHANGED: node_col now comes from resolve_node_color() (per-taxon,
+  # matched to Figures 5-7), not r$nodeCols (the old 3-way domain scheme).
+  node_col <- node_colors[node_order]
+
+  w_rng <- range(abs(edges$asso))
+  edge_lwd <- if (diff(w_rng) > 0) 0.3 + 3 * (abs(edges$asso) - w_rng[1]) / diff(w_rng)
+              else rep(1, nrow(edges))
+  edge_col <- ifelse(edges$asso >= 0, COL_EDGE_POS, COL_EDGE_NEG)
+
+  # CHANGED (per request): the circle and the legend now live in two
+  # SEPARATE layout() panels, side by side. Previously the legend was
+  # drawn at data-coordinate x = 1.65, in the SAME coordinate system as
+  # the circle itself (canvas.xlim/ylim = c(-1.5, 1.5)) - but circlize
+  # keeps that coordinate system aspect-locked 1:1 so the circle doesn't
+  # stretch into an ellipse. On a wide device, that lock means most of
+  # the extra width outside the circle is empty margin the plotting
+  # coordinates can't actually reach - widening the device didn't give
+  # the legend more usable room, just more invisible margin. A separate
+  # layout() panel has its own genuine width, independent of the circle's
+  # aspect lock, so a 3rd (or 4th) legend column reliably stays on-canvas.
+  # LAYOUT_WIDTHS is the circos-panel : legend-panel width ratio - widen
+  # the second number if columns are still tight once you see it rendered.
+  LAYOUT_WIDTHS <- c(0.58, 0.42)
+  layout(matrix(c(1, 2), nrow = 1), widths = LAYOUT_WIDTHS)
+
+  # ---- Panel 1: circos plot only (no legend drawn in this panel) ----
+  circos.clear()
+  circos.par(start.degree = 90, clock.wise = TRUE, gap.degree = 1,
+             cell.padding = c(0, 0, 0, 0), track.margin = c(0.005, 0.005),
+             canvas.xlim = c(-1.3, 1.3), canvas.ylim = c(-1.3, 1.3))
+  circos.initialize(sectors = node_order, xlim = c(0, 1))
+
+  # CHANGED (per request): track creation order swapped so numbers sit
+  # OUTSIDE the point markers, not inside. circlize places each new
+  # circos.track() just INSIDE the previously created one - so whichever
+  # track is created first ends up outermost. Previously points were
+  # created first (outermost) and numbers second (nested inside them);
+  # now numbers are created first (track.index = 1, outermost) and points
+  # second (track.index = 2, just inside the numbers ring).
+  circos.track(ylim = c(0, 1), track.height = mm_h(6), bg.border = NA,
+               panel.fun = function(x, y) {
+                 sec <- CELL_META$sector.index
+                 is_hab <- sec %in% hab_present
+                 circos.text(0.5, 0.2, labels = as.character(node_number[sec]),
+                             facing = "clockwise", niceFacing = TRUE,
+                             adj = c(0, 0.5),
+                             cex  = if (is_hab) LABEL_CEX_HAB else LABEL_CEX_PARTNER,
+                             font = if (is_hab) LABEL_FONT_HAB else LABEL_FONT_PARTNER)
+               })
+
+  circos.track(ylim = c(0, 1), track.height = mm_h(4), bg.border = NA,
+               panel.fun = function(x, y) {
+                 sec <- CELL_META$sector.index
+                 circos.points(0.5, 0.5, pch = 16, cex = node_cex[sec], col = node_col[sec])
+               })
+
+  # circos.link()'s default attachment radius is "just inside the most
+  # recently created track" - calling it here (after the points track,
+  # now the innermost one) keeps links attaching right at the points,
+  # exactly as before; only the points track's radial position changed,
+  # not where links attach relative to it.
+  for (i in seq_len(nrow(edges))) {
+    circos.link(edges$v1[i], 0.5, edges$v2[i], 0.5, col = edge_col[i], lwd = edge_lwd[i])
+  }
+
+  # Outline circle marking the HAB-anchor nodes specifically. track.index
+  # updated to 2 (points track's new index, since numbers are now
+  # track.index 1) - this MUST match wherever the points track actually
+  # is, or the black outline circles would be drawn at the wrong radius.
+  hab_polar <- t(sapply(hab_present, function(nm) circlize(0.5, 0.5, sector.index = nm, track.index = 2)))
+  colnames(hab_polar) <- c("theta", "rou")
+  hab_x <- hab_polar[, "rou"] * cos(hab_polar[, "theta"] * pi / 180)
+  hab_y <- hab_polar[, "rou"] * sin(hab_polar[, "theta"] * pi / 180)
+  points(hab_x, hab_y, pch = 21, cex = node_cex[hab_present] * 1.15,
+         col = "black", bg = NA, lwd = 1.2)
+
+  title(paste0(lake_lookup[code], " - HAB genera + top ", TOP_N_PARTNERS, " partners each"), cex.main = 1.1)
+
+  legend("bottom", inset = -0.02, horiz = TRUE, cex = 0.55, pt.cex = 1.1, xpd = NA,
+         legend = c("+ association", "- association"),
+         col = c(COL_EDGE_POS, COL_EDGE_NEG),
+         lty = c(1, 1), lwd = 2, bty = "n")
+
+  circos.clear()
+
+  # ---- Panel 2: legend only, in its own plain (non-aspect-locked) plot
+  # region, sized by LAYOUT_WIDTHS[2] above - this is what makes every
+  # column genuinely fit rather than running off the device. ----
+  par(mar = c(1, 0.5, 1, 0.5))
+  plot.new()
+
+  # ROWS_PER_LEGEND_COL controls column-wrapping; LEGEND_CEX controls text
+  # size - adjustable together if a given lake's node count still doesn't
+  # fit comfortably: fewer rows-per-column -> more, narrower columns
+  # (needs more of LAYOUT_WIDTHS[2]); more rows-per-column -> fewer,
+  # wider columns (needs more device height instead).
+  ROWS_PER_LEGEND_COL <- 26
+  LEGEND_CEX <- 0.55
+  numbered_labels <- paste0(node_number[node_order], ". ", node_labels[node_order])
+  legend("topleft", xpd = NA,
+         legend = numbered_labels, pch = 16, col = node_col,
+         cex = LEGEND_CEX, pt.cex = 1, bty = "n",
+         ncol = ceiling(length(node_order) / ROWS_PER_LEGEND_COL),
+         title = "Taxa (colored by Phylum / Taxa2 / cyanobacteria Taxa)",
+         title.cex = 0.62)
+
+  # Reset to a single-panel layout so anything plotted after this
+  # function returns (in the same R session) isn't stuck in a 2-panel
+  # layout left over from this call.
+  layout(1)
+}
+
+for (code in names(lake_results)) {
+  r <- lake_results[[code]]
+
+  hab_present <- intersect(HAB_TAXA, r$taxa)
+  missing_hab <- setdiff(HAB_TAXA, r$taxa)
+  if (length(missing_hab) > 0) {
+    message("Lake ", code, ": HAB-list genera not present in this lake's filtered ",
+            "network - ", paste(missing_hab, collapse = ", "))
+  }
+
+  if (length(hab_present) == 0) {
+    message("Lake ", code, ": no HAB-list genera present - skipping")
+    plot.new()
+    title(main = paste0(lake_lookup[code], "\n(no HAB-list genera in filtered network)"))
+    next
+  }
+
+  edges <- r$net$edgelist1
+
+  partner_taxa <- character(0)
+  for (tx in hab_present) {
+    partner_taxa <- union(partner_taxa, get_top_n_partners(edges, tx, TOP_N_PARTNERS))
+  }
+  partner_taxa <- setdiff(partner_taxa, hab_present)
+
+  neighbor_set <- sort(unique(c(hab_present, partner_taxa)))
+
+  cat("Lake", code, "-", length(hab_present), "HAB-list genera present;",
+      length(partner_taxa), "unique top-", TOP_N_PARTNERS, "partner(s) across them;",
+      length(neighbor_set), "total nodes in this lake's HAB subnetwork\n")
+
+  # Resolve color + legend label for every node in this lake's subnetwork,
+  # once, before plotting - shared by both the svg() and on-screen render
+  # calls below, and by the legend.
+  resolved <- lapply(neighbor_set, function(tx) resolve_node_color(tx, r$domain[[tx]]))
+  node_colors <- setNames(vapply(resolved, function(x) x$color, character(1)), neighbor_set)
+  node_labels <- setNames(vapply(resolved, function(x) x$label, character(1)), neighbor_set)
+
+  # Wider canvas (20 vs the previous 16) - numbers freed up space on the
+  # ring itself, but the legend gained a few characters per row ("N. "
+  # prefix) and may need up to 3 columns for Lake Rippowam's 78 nodes;
+  # this keeps the legend text at a readable size (LEGEND_CEX = 0.52
+  # above) without crowding the circle.
+  # Widened again (24 vs the previous 20) now that the legend has its own
+  # real panel width (LAYOUT_WIDTHS[2] = 0.42 of this total) instead of
+  # sharing the circle's aspect-locked coordinate space - this is what
+  # actually fixes the 3rd-column-runs-off-the-device problem; the extra
+  # device width now translates directly into extra legend-panel width.
+  svg(paste0("results/HAB_subnetwork_", code, ".svg"), width = 24, height = 10)
+  plot_hab_subnetwork_circlize(code, neighbor_set, hab_present, partner_taxa, node_colors, node_labels)
+  dev.off()
+
+  plot_hab_subnetwork_circlize(code, neighbor_set, hab_present, partner_taxa, node_colors, node_labels)
+
+  # Number column matches exactly what's drawn on the ring and listed in
+  # the legend (both computed identically, from sort(neighbor_set), inside
+  # plot_hab_subnetwork_circlize) - included here so the CSV can serve as
+  # a caption-ready number-to-taxon key alongside the figure.
+  node_number_ref <- setNames(seq_along(sort(neighbor_set)), sort(neighbor_set))
+  neighbor_tables[[code]] <- data.frame(
+    Lake = lake_lookup[code], Number = node_number_ref[neighbor_set], Taxon = neighbor_set,
+    Domain = r$domain[neighbor_set], is_HAB = neighbor_set %in% HAB_TAXA,
+    is_HAB_anchor = neighbor_set %in% hab_present,
+    Legend_Label = node_labels[neighbor_set],
+    Color = node_colors[neighbor_set],
+    row.names = NULL
+  )
+}
+
+neighbor_table_all <- do.call(rbind, neighbor_tables)
+neighbor_table_all <- neighbor_table_all[order(neighbor_table_all$Lake, neighbor_table_all$Number), ]
+write.csv(neighbor_table_all, "results/HAB_subnetwork_taxon_reference.csv", row.names = FALSE)
+cat("\n=== HAB subnetwork taxon reference table (also written to CSV) ===\n")
+print(neighbor_table_all)
+```
+
+# 8. Sorted diverging bar ("tornado") plot per HAB taxon
+
+One panel per HAB-list genus present in a lake's filtered network: every
+direct co-occurrence partner, sorted by `|association|`, bars extending
+left (negative) or right (positive) of zero. Reuses `r$net$edgelist1` and
+`r$domain` directly -- no statistic recomputed.
+
+```{r hab-bars-function}
+# =====================================================================
+# Section 8 replacement, v2: "Sorted diverging bar ('tornado') plot per
+# HAB taxon", now using:
+#   - Partners: top TOP_N_PARTNERS (5) by |asso| per anchor taxon (same
+#     get_top_n_partners() helper and same TOP_N_PARTNERS value already
+#     defined in Section 7 v3 - NOT recomputed independently, so the two
+#     sections can never disagree on what "top 5 by asso" means).
+#   - Partner label color + text: resolve_node_color() from Section 7 v3
+#     (Phylum for 16S, Taxa2 for 18S, bare Taxon for cyanobacteria) -
+#     replaces the old 2-color 16S/18S domain scheme.
+#
+# REQUIRES Section 7 v3 (section7_v3_taxon_colors.R) to already be
+# sourced/run - get_top_n_partners(), resolve_node_color(), safe_lookup(),
+# and the three color lookup tables all come from there.
+#
+# Anchor taxa (which genera get a panel at all) are UNCHANGED from the
+# previous version: top_hab_by_abundance[[code]], from the abundance-
+# ranking chunk before this one - top 5 HAB_TAXA genera by mean relative
+# abundance within Cyanobacteria, matching Figure 6.
+# =====================================================================
+
+if (!exists("resolve_node_color") || !exists("get_top_n_partners")) {
+  stop("Section 8 v2 requires Section 7 v3 (section7_v3_taxon_colors.R) to be run first - ",
+       "resolve_node_color() and get_top_n_partners() are not defined. Run that chunk, ",
+       "then re-run this one.")
+}
+
+#' Plot the top-N co-occurrence partners of one HAB taxon by |association|,
+#' colored and labeled using Section 7's resolve_node_color() (Phylum/
+#' Taxa2/cyanobacteria-Taxa scheme), sorted by |asso|. Labels sit in a
+#' single right-aligned column past the bars, so they never overlap a bar
+#' regardless of association sign.
+plot_hab_bars <- function(lake_code, taxon, top_n = TOP_N_PARTNERS) {
+  r <- lake_results[[lake_code]]
+  edges <- r$net$edgelist1
+
+  top_partners <- get_top_n_partners(edges, taxon, top_n)
+
+  if (length(top_partners) == 0) {
+    message("Lake ", lake_code, ": '", taxon, "' has no edges in the filtered ",
+            "network - skipping its bar panel")
+    return(
+      ggplot() +
+        annotate("text", x = 0, y = 0,
+                 label = paste0(taxon, "\n(no network edges)"), size = 4.2) +
+        theme_void()
+    )
+  }
+
+  touch <- edges$v1 == taxon | edges$v2 == taxon
+  sub <- edges[touch, ]
+  sub$partner <- ifelse(sub$v1 == taxon, sub$v2, sub$v1)
+  sub <- sub[sub$partner %in% top_partners, ]
+  sub$partner_domain <- r$domain[sub$partner]
+
+  # Resolve each partner's color + display label (e.g. "Comamonas
+  # (Proteobacteria)", or bare "Cyanobium" if the partner is itself
+  # cyanobacteria) - same function Section 7's network figure uses, so a
+  # given taxon's color is identical across every figure in the manuscript.
+  resolved <- lapply(seq_len(nrow(sub)), function(i) {
+    resolve_node_color(sub$partner[i], sub$partner_domain[i])
+  })
+  sub$partner_color <- vapply(resolved, function(x) x$color, character(1))
+  sub$partner_label <- vapply(resolved, function(x) x$label, character(1))
+
+  sub <- sub[order(abs(sub$asso)), ]
+  # Factor levels stay the raw taxon name (preserves |asso| sort order);
+  # the DISPLAYED text comes from label_lookup via scale_y_discrete()
+  # below, ggplot's own axis-text mechanism - drawn in the plot margin,
+  # outside the panel, so it can never collide with a bar regardless of
+  # sign. Replaces the previous geom_text() column manually positioned
+  # past the bars, which was only ever a workaround for not having used
+  # a real axis to begin with.
+  sub$partner <- factor(sub$partner, levels = sub$partner)
+  label_lookup <- setNames(sub$partner_label, as.character(sub$partner))
+
+  # CHANGED (per request): bar FILL is now the taxon color (Phylum/Taxa2/
+  # cyanobacteria-Taxa, via scale_fill_identity()) - association direction
+  # (positive/negative) is conveyed by bar position alone (left/right of
+  # the zero line), no longer by color, since that role moved to the bars.
+  # Axis text (right side, via scale_y_discrete position) is plain black
+  # italic (genus-name convention) - the color-coding lives on the bar.
+  ggplot(sub, aes(x = asso, y = partner)) +
+    geom_col(aes(fill = partner_color), width = 0.7) +
+    geom_vline(xintercept = 0, color = "gray40") +
+    scale_fill_identity() +
+    scale_y_discrete(labels = label_lookup, position = "right") +
+    labs(x = "Association (symmetrized MB coefficient)", y = NULL,
+         title = paste0(taxon, " - ", lake_lookup[lake_code])) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.y  = element_text(face = "italic", size = 10),
+      axis.ticks.y = element_blank(),
+      panel.grid.major.y = element_blank(),
+      plot.title   = element_text(size = 10, face = "bold"),
+      axis.title.x = element_text(size = 9),
+      axis.text.x  = element_text(size = 10)
+    )
+}
+
+for (code in names(lake_results)) {
+  r <- lake_results[[code]]
+
+  # Anchor taxa unchanged: top_hab_by_abundance[[code]] (top 5 HAB_TAXA
+  # genera by mean relative abundance within Cyanobacteria, matching
+  # Figure 6 - see the abundance-ranking chunk before Section 8).
+  taxa_to_plot <- top_hab_by_abundance[[code]]
+
+  if (length(taxa_to_plot) == 0) {
+    message("Lake ", code, ": no abundance-ranked HAB genera available - skipping bar panels")
+    next
+  }
+
+  panel_list <- lapply(taxa_to_plot, function(tx) plot_hab_bars(code, tx, top_n = TOP_N_PARTNERS))
+
+  is_valid <- vapply(panel_list, function(x) inherits(x, "gg"), logical(1))
+  if (!all(is_valid)) {
+    stop("Lake ", code, ": plot_hab_bars() returned a non-ggplot object for ",
+         "taxon/taxa: ", paste(taxa_to_plot[!is_valid], collapse = ", "),
+         ". Fix plot_hab_bars() before proceeding - not skipping silently.")
+  }
+
+  # CHANGED (per request): single column, not a sqrt(n)-based grid - each
+  # panel gets the figure's full width, leaving room for long taxonomic
+  # names like "Burkholderiales_MWH-UniP1-aquatic-group_unclassified
+  # (Proteobacteria)" that a multi-column layout would cramp or clip.
+  n_taxa <- length(panel_list)
+  n_row <- n_taxa
+  n_col <- 1
+
+  combined <- patchwork::wrap_plots(panel_list, nrow = n_row, ncol = n_col) +
+    patchwork::plot_annotation(
+      title = paste0(lake_lookup[code], " - Top ", n_taxa, " HAB genera by abundance: ",
+                      "top ", TOP_N_PARTNERS, " co-occurrence partners by |asso|"),
+      theme = theme(plot.title = element_text(size = 13, face = "bold"))
+    )
+
+  print(combined)
+
+  # Wider fixed width (9in) now that there's only one column - the old
+  # "4 * n_col" formula gave just 4in for n_col = 1, far too narrow for
+  # the appended "(Phylum)"/"(Taxa2)" text. Height scales with panel count
+  # as before (3.2in per row).
+  ggsave(paste0("results/HAB_bars_top", TOP_N_ABUNDANT, "_", code, ".svg"), combined,
+         width = 9, height = 3.2 * n_row, dpi = 300, limitsize = FALSE)
+}
+```
+
+# =========================================================================
+# 8a. Faceted heat map of HAB taxon x associated-taxon co-occurrence
+#    Rows = HAB-list genera present in a lake's filtered network.
+#    Columns = every direct co-occurrence partner of any HAB taxon in that
+#    lake (may itself be a HAB genus). Cell value = symmetrized MB
+#    association ("asso") from r$net$edgelist1 - no statistic recomputed,
+#    same source data as the original Section 8 tornado plot.
+#    One heat map per lake; panels share one color scale (see below) so
+#    they are visually comparable, combined via gridExtra per pheatmap's
+#    own documented pattern (silent=TRUE -> $gtable -> grid.arrange()).
+# =========================================================================
+
+```{r facet heat maps}
+# =========================================================================
+# 8a. Faceted heat map: partner universe = union of each anchor's own
+#     top-N partners; cells filled with REAL asso value wherever an edge
+#     exists in that universe; an asterisk marks cells that are a genus's
+#     OWN top-N partner (via pheatmap's documented display_numbers matrix,
+#     not a border overlay).
+# =========================================================================
+
+if (!exists("resolve_node_color") || !exists("get_top_n_partners")) stop("Run Section 7 v3 first.")
+if (!exists("top_hab_by_abundance") || !exists("TOP_N_ABUNDANT")) stop("Run Section 7a first.")
+required_pkgs <- c("pheatmap", "grid")
+missing_pkgs  <- required_pkgs[!vapply(required_pkgs, requireNamespace, quietly = TRUE, FUN.VALUE = logical(1))]
+if (length(missing_pkgs) > 0) stop("Missing package(s): ", paste(missing_pkgs, collapse = ", "))
+library(pheatmap); library(grid)
+
+# ---- Step 1: partner universe = union of top-N; CELLS FILLED WITH REAL
+# VALUES against that whole universe (not restricted to each genus's own
+# top-N); top_mat flags which cells ARE that genus's own top-N ----
+build_hab_heatmap_data <- function(lake_code, top_n = TOP_N_PARTNERS) {
+  r <- lake_results[[lake_code]]
+  edges <- r$net$edgelist1
+  taxa_to_plot <- top_hab_by_abundance[[lake_code]]
+  if (length(taxa_to_plot) == 0) {
+    message("Lake ", lake_code, ": no abundance-ranked HAB genera - skipping heat map")
+    return(NULL)
+  }
+
+  top_partners_per_taxon <- setNames(
+    lapply(taxa_to_plot, function(tx) get_top_n_partners(edges, tx, top_n)), taxa_to_plot)
+  partner_names <- sort(unique(unlist(top_partners_per_taxon)))
+  if (length(partner_names) == 0) {
+    message("Lake ", lake_code, ": no top-N partners found - skipping heat map")
+    return(NULL)
+  }
+
+  mat <- matrix(NA_real_, nrow = length(taxa_to_plot), ncol = length(partner_names),
+                dimnames = list(taxa_to_plot, partner_names))
+  top_mat <- matrix(FALSE, nrow = length(taxa_to_plot), ncol = length(partner_names),
+                     dimnames = list(taxa_to_plot, partner_names))
+
+  for (taxon in taxa_to_plot) {
+    touch <- edges$v1 == taxon | edges$v2 == taxon
+    sub <- edges[touch, ]
+    if (nrow(sub) == 0) next
+    sub$partner <- ifelse(sub$v1 == taxon, sub$v2, sub$v1)
+    sub <- sub[sub$partner %in% partner_names, ]   # only restricts to the fixed column set
+    if (nrow(sub) == 0) next
+    mat[taxon, sub$partner] <- sub$asso                                   # REAL value, always
+    top_mat[taxon, sub$partner] <- sub$partner %in% top_partners_per_taxon[[taxon]]  # flag only
+  }
+
+  resolve_one <- function(tx) resolve_node_color(tx, r$domain[[tx]])
+  row_resolved <- lapply(taxa_to_plot, resolve_one)
+  col_resolved <- lapply(partner_names, resolve_one)
+
+  list(mat = mat, top_mat = top_mat,
+       row_label = setNames(vapply(row_resolved, function(x) x$label, character(1)), taxa_to_plot),
+       row_color = setNames(vapply(row_resolved, function(x) x$color, character(1)), taxa_to_plot),
+       col_label = setNames(vapply(col_resolved, function(x) x$label, character(1)), partner_names),
+       col_color = setNames(vapply(col_resolved, function(x) x$color, character(1)), partner_names))
+}
+
+# ---- Step 2 ----
+lake_heat_data <- lapply(names(lake_results), build_hab_heatmap_data)
+names(lake_heat_data) <- names(lake_results)
+lake_heat_data <- lake_heat_data[!vapply(lake_heat_data, is.null, logical(1))]
+if (length(lake_heat_data) == 0) stop("No lake had usable HAB genus/partner data.")
+
+# ---- Step 3 ----
+max_abs_asso <- max(abs(unlist(lapply(lake_heat_data, function(d) d$mat[!is.na(d$mat)]))))
+breaks_seq   <- seq(-max_abs_asso, max_abs_asso, length.out = 101)
+heat_colors  <- colorRampPalette(c(COL_EDGE_NEG, "white", COL_EDGE_POS))(100)
+
+# ---- Step 4 ----
+lake_order <- names(lake_heat_data)
+col_ids <- character(0); col_labels <- character(0); col_lake <- character(0); col_color <- character(0)
+for (code in lake_order) {
+  d <- lake_heat_data[[code]]
+  genera <- rownames(d$mat)
+  col_ids    <- c(col_ids, paste0(genera, "__", code))
+  col_labels <- c(col_labels, d$row_label[genera])
+  col_lake   <- c(col_lake, rep(lake_lookup[code], length(genera)))
+  col_color  <- c(col_color, d$row_color[genera])
+}
+
+# ---- Step 5 ----
+partner_label_lookup <- character(0); partner_color_lookup <- character(0)
+for (code in lake_order) {
+  d <- lake_heat_data[[code]]
+  new_partners <- setdiff(colnames(d$mat), names(partner_label_lookup))
+  if (length(new_partners) > 0) {
+    partner_label_lookup[new_partners] <- d$col_label[new_partners]
+    partner_color_lookup[new_partners] <- d$col_color[new_partners]
+  }
+}
+
+# ---- Step 6 ----
+all_partners_raw <- sort(unique(unlist(lapply(lake_heat_data, function(d) colnames(d$mat)))))
+extract_group <- function(label) {
+  has_paren <- grepl("\\(.*\\)$", label)
+  ifelse(has_paren, sub("^.*\\((.*)\\)$", "\\1", label), "Cyanobacteria (genus-level)")
+}
+partner_group_lookup <- setNames(extract_group(partner_label_lookup[all_partners_raw]), all_partners_raw)
+all_partners <- all_partners_raw[order(partner_group_lookup[all_partners_raw], all_partners_raw)]
+
+# ---- Step 7: combined_mat AND combined_top_mask ----
+combined_mat <- matrix(NA_real_, nrow = length(all_partners), ncol = length(col_ids),
+                        dimnames = list(all_partners, col_ids))
+combined_top_mask <- matrix(FALSE, nrow = length(all_partners), ncol = length(col_ids),
+                             dimnames = list(all_partners, col_ids))
+for (code in lake_order) {
+  d <- lake_heat_data[[code]]
+  genera <- rownames(d$mat)
+  ids    <- paste0(genera, "__", code)
+  tmat     <- t(d$mat)
+  tmat_top <- t(d$top_mat)
+  combined_mat[rownames(tmat), ids]          <- tmat
+  combined_top_mask[rownames(tmat_top), ids] <- tmat_top
+}
+
+# ---- Step 8 ----
+row_group_ordered <- partner_group_lookup[all_partners]
+group_counts <- table(factor(row_group_ordered, levels = unique(row_group_ordered)))
+gap_row_positions <- cumsum(group_counts); gap_row_positions <- gap_row_positions[-length(gap_row_positions)]
+lake_col_counts <- table(factor(col_lake, levels = lake_lookup[lake_order]))
+gap_col_positions <- cumsum(lake_col_counts); gap_col_positions <- gap_col_positions[-length(gap_col_positions)]
+
+# ---- Step 9 ----
+col_group_lookup <- setNames(extract_group(col_labels), col_ids)
+row_ann <- data.frame(Taxon = partner_group_lookup[rownames(combined_mat)], row.names = rownames(combined_mat))
+col_ann <- data.frame(Lake = col_lake, Taxon = col_group_lookup[col_ids], row.names = col_ids)
+
+group_to_color <- character(0)
+all_labels_and_colors <- c(setNames(col_color, col_labels), setNames(partner_color_lookup, partner_label_lookup))
+all_groups_by_label <- extract_group(names(all_labels_and_colors))
+for (i in seq_along(all_labels_and_colors)) {
+  g <- all_groups_by_label[i]
+  if (!(g %in% names(group_to_color))) group_to_color[g] <- all_labels_and_colors[i]
+}
+LAKE_COLORS <- setNames(c("#3498DB", "#E69F00", "#999999")[seq_along(lake_order)], lake_lookup[lake_order])
+ann_colors <- list(Taxon = group_to_color, Lake = LAKE_COLORS)
+
+# ---- Step 10: build the asterisk matrix (pheatmap's documented
+# display_numbers pattern), aligned to combined_mat's FINAL row/col order ----
+top_mask_ordered <- combined_top_mask[rownames(combined_mat), colnames(combined_mat)]
+star_mat <- matrix(ifelse(top_mask_ordered, "*", ""),
+                    nrow = nrow(combined_mat), ncol = ncol(combined_mat))
+
+CELLWIDTH_PT <- 10; CELLHEIGHT_PT <- 10
+
+hp <- pheatmap(combined_mat,
+                color = heat_colors, breaks = breaks_seq, na_col = "grey89",
+                cluster_rows = FALSE, cluster_cols = FALSE,
+                gaps_row = as.integer(gap_row_positions), gaps_col = as.integer(gap_col_positions),
+                cellwidth = CELLWIDTH_PT, cellheight = CELLHEIGHT_PT,
+                labels_row = partner_label_lookup[rownames(combined_mat)], labels_col = col_labels,
+                annotation_row = row_ann, annotation_col = col_ann,
+                annotation_legend = TRUE, annotation_colors = ann_colors,
+                display_numbers = star_mat,           # asterisk = this genus's own top-N partner
+                number_color = "black", fontsize_number = 10,
+                fontsize_row = 10, fontsize_col = 10, angle_col = 45,
+                main = paste0("Top HAB genera by abundance x top ", TOP_N_PARTNERS,
+                               " co-occurrence partners by |asso| (symmetrized MB coefficient).\n",
+                               "* = this genus's own top ", TOP_N_PARTNERS, " partner by |asso|"),
+                silent = TRUE)
+
+required_width_in  <- grid::convertWidth(sum(hp$gtable$widths),  "in", valueOnly = TRUE)
+required_height_in <- grid::convertHeight(sum(hp$gtable$heights), "in", valueOnly = TRUE)
+cat("Measured gtable size:", round(required_width_in, 2), "in x", round(required_height_in, 2), "in\n")
+
+grid.newpage()
+grid.draw(hp$gtable)
+
+svg(paste0("results/HAB_heatmap_top", TOP_N_ABUNDANT, "_all_lakes.svg"),
+    width = required_width_in, height = required_height_in)
+grid.draw(hp$gtable)
+dev.off()
+```
+
+# 9. Cross-lake network comparison (`NetCoMi::netCompare`)
+
+`netCompare()` requires the same taxon set in both networks being
+compared, so this is restricted to taxa passing the prevalence filter in
+**both** lakes. Permutation p-values are unavailable when comparing
+precomputed association matrices rather than raw counts (documented
+SpiecEasi/NetCoMi limitation), so `permTest = FALSE` -- this yields
+descriptive, not p-value-based, comparison of network structure (see
+Results outline Section 1.2/5.3).
+
+```{r netcompare}
+lake_codes <- names(lake_results)
+lake_pairs <- combn(lake_codes, 2, simplify = FALSE)
+netcompare_results <- list()
+
+for (pair in lake_pairs) {
+  a <- pair[1]; b <- pair[2]
+  shared_taxa <- intersect(lake_results[[a]]$taxa, lake_results[[b]]$taxa)
+
+  if (length(shared_taxa) < 3) {
+    message("Skipping ", a, " vs ", b, ": fewer than 3 shared taxa after filtering.")
+    next
+  }
+
+  assoA <- lake_results[[a]]$assoMat[shared_taxa, shared_taxa]
+  assoB <- lake_results[[b]]$assoMat[shared_taxa, shared_taxa]
+
+  netC   <- NetCoMi::netConstruct(data = assoA, data2 = assoB,
+                                   dataType = "condDependence", sparsMethod = "none")
+  propsC <- NetCoMi::netAnalyze(netC, hubPar = "eigenvector", clustMethod = "cluster_fast_greedy")
+  compC  <- NetCoMi::netCompare(propsC, permTest = FALSE)
+
+  netcompare_results[[paste(a, b, sep = "_vs_")]] <- compC
+  cat("\n=== Network comparison:", a, "vs", b, "(", length(shared_taxa), "shared taxa) ===\n")
+  print(summary(compC, groupNames = c(a, b)))
+
+  # Export this comparison to a text file. capture.output() records exactly
+  # what summary() already prints to console (global network properties,
+  # centrality comparisons, Jaccard index of hub overlap, Rand index, and
+  # Graphlet Correlation Distance) - this is the reliable export path since
+  # NetCoMi's own help pages do not fully document every internal field name
+  # of the returned microNetComp object, so extracting a specific field
+  # directly (e.g. into a CSV) risks guessing at names that may not exist or
+  # may differ by NetCoMi version.
+  comp_txt <- capture.output({
+    cat("Network comparison:", a, "vs", b, "\n")
+    cat("Shared taxa (nodes) used in comparison:", length(shared_taxa), "\n\n")
+    print(summary(compC, groupNames = c(a, b)))
+  })
+  writeLines(comp_txt, paste0("results/netcompare_", a, "_vs_", b, ".txt"))
+}
+
+# Combined file with all pairwise comparisons together, for convenience
+all_comp_txt <- unlist(lapply(names(netcompare_results), function(nm) {
+  parts <- strsplit(nm, "_vs_")[[1]]
+  c("", "", paste("=== Network comparison:", parts[1], "vs", parts[2], "==="),
+    capture.output(print(summary(netcompare_results[[nm]], groupNames = parts))))
+}))
+writeLines(all_comp_txt, "results/netcompare_all_comparisons.txt")
+cat("\nSection 9 exported to results/netcompare_<lake>_vs_<lake>.txt (one file per pair)",
+    "\nand results/netcompare_all_comparisons.txt (all pairs combined).\n")
+
+# -------------------------------------------------------------------------
+# Structured (non-text) exports and a combined GCD + Jaccard figure.
+#
+# netcompare_results is populated in the loop above (one microNetComp
+# object per lake pair). Fields extracted below are limited to those
+# NetCoMi's own documentation confirms:
+# https://netcomi.de/reference/netcompare ("Value" section).
+# -------------------------------------------------------------------------
+
+# ----- Global properties (documented field: diffGlobal - a named vector of
+# differences for the 10 global network properties) -----
+global_summary <- do.call(rbind, lapply(names(netcompare_results), function(nm) {
+  cc <- netcompare_results[[nm]]
+  data.frame(
+    comparison = nm,
+    property   = names(cc$diffGlobal),
+    difference = as.numeric(cc$diffGlobal),
+    row.names  = NULL
+  )
+}))
+write.csv(global_summary, "results/netcompare_global_properties.csv", row.names = FALSE)
+
+# ----- Graphlet Correlation Distance (GCD) -----
+# calcGCD() - the function netCompare() calls internally to populate $gcd
+# and $gcdLCC - documents its return value as a list with elements gcd,
+# ocount1, ocount2, gcm1, gcm2 (https://rdrr.io/github/stefpeschel/NetCoMi/
+# src/R/calcGCD.R). The scalar distance is therefore cc$gcd$gcd, NOT
+# cc$gcd[1] (single-bracket indexing on a list returns a length-1 LIST,
+# not a bare number, which would silently break the data.frame/plot below).
+gcd_summary <- do.call(rbind, lapply(names(netcompare_results), function(nm) {
+  cc <- netcompare_results[[nm]]
+  data.frame(comparison   = nm,
+             GCD_wholeNet = cc$gcd$gcd,
+             GCD_LCC      = cc$gcdLCC$gcd)
+}))
+write.csv(gcd_summary, "results/netcompare_gcd.csv", row.names = FALSE)
+
+# ----- Jaccard index (overlap of most-central nodes per centrality type) -----
+# NetCoMi's documentation confirms jaccDeg/jaccBetw/jaccClose/jaccEigen/
+# jaccHub hold "Values of Jaccard's index for the centrality measures," but
+# does NOT specify the internal element names within each (the printed
+# summary shows a Jacc value plus two p-values per row, so each is some
+# short vector/list - exact names unconfirmed in the public docs). Rather
+# than guess - the same caution already applied to $hubs in Section 15 -
+# the Jacc values are parsed from the summary() print text captured just
+# above, whose row format is fixed by NetCoMi's own summary.microNetComp()
+# method and matches the official documentation example exactly.
+jacc_labels <- c("degree", "betweenness centr.", "closeness centr.",
+                  "eigenvec. centr.", "hub taxa")
+
+parse_jaccard_block <- function(summary_lines) {
+  do.call(rbind, lapply(jacc_labels, function(lab) {
+    esc <- gsub("([.])", "\\\\.", lab)
+    ln  <- grep(paste0("^", esc), trimws(summary_lines), value = TRUE)
+
+    if (length(ln) == 0) {
+      return(data.frame(centrality = lab, Jacc = NA_real_,
+                         P_le_Jacc = NA_real_, sig_le = ""))
+    }
+
+    # Tokens remaining after stripping the row label, in the fixed column
+    # order NetCoMi's summary.microNetComp() prints: Jacc, P(<=Jacc),
+    # [optional sig. code], P(>=Jacc), [optional sig. code]
+    tokens <- strsplit(trimws(sub(lab, "", ln[1], fixed = TRUE)), "\\s+")[[1]]
+
+    jacc_val <- as.numeric(tokens[1])
+    p_le     <- as.numeric(tokens[2])
+
+    # A significance-code token is one of ***, **, *, . per NetCoMi's own
+    # printed footer ("Significance codes: ***: 0.001, **: 0.01, *: 0.05,
+    # .: 0.1"). If tokens[3] matches this pattern, it belongs to P(<=Jacc),
+    # not P(>=Jacc) - confirmed against the format in netcompare_all_
+    # comparisons.txt (e.g. "0.137    0.000001 ***  1.000000").
+    is_sig_code <- grepl("^(\\*{1,3}|\\.)$", tokens[3])
+    sig_le <- if (is_sig_code) tokens[3] else ""
+
+    data.frame(centrality = lab, Jacc = jacc_val,
+               P_le_Jacc = p_le, sig_le = sig_le)
+  }))
+}
+
+jacc_summary <- do.call(rbind, lapply(names(netcompare_results), function(nm) {
+  parts <- strsplit(nm, "_vs_")[[1]]
+  lines <- capture.output(print(summary(netcompare_results[[nm]], groupNames = parts)))
+  df <- parse_jaccard_block(lines)
+  df$comparison <- nm
+  df
+}))
+write.csv(jacc_summary, "results/netcompare_jaccard.csv", row.names = FALSE)
+
+# ----- Combined 2-panel figure: GCD (left) + Jaccard index (right) -----
+
+PAIR_COLORS <- setNames(c("#E69F00", "#56B4E9", "#009E73"), names(netcompare_results))
+
+p_gcd <- ggplot(gcd_summary, aes(x = comparison, y = GCD_wholeNet, fill = comparison)) +
+  geom_col(width = 0.6) +   # FIXED: explicit width, matched to panel B's bar width below
+  scale_fill_manual(values = PAIR_COLORS, guide = "none") +
+  labs(x = "Lake pair", y = "GCD",
+       title = "Structural dissimilarity (GCD)") +
+  theme_minimal(base_size = 10)
+
+p_jacc <- ggplot(jacc_summary, aes(x = centrality, y = Jacc, fill = comparison)) +
+  geom_col(width = 0.6, position = position_dodge(width = 0.7, preserve = "single")) +
+  # Significance stars for P(<=Jacc), positioned above each dodged bar -
+  # group = comparison keeps each star aligned with its own bar rather
+  # than all three collapsing to one x position
+  geom_text(aes(label = sig_le, group = comparison),
+            position = position_dodge(width = 0.7),
+            vjust = -0.3, size = 3, show.legend = FALSE) +
+  scale_fill_manual(values = PAIR_COLORS, name = "Lake pair") +
+  scale_x_discrete(labels = scales::label_wrap(10)) +
+  # Extra headroom above the tallest bar so stars aren't clipped
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = NULL, y = "Jaccard index",
+       title = "Overlap of most-central nodes",
+       caption = "Stars = significance of P(\u2264Jacc): *** p<0.001, ** p<0.01") +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5),
+        plot.caption = element_text(size = 7, hjust = 0))
+
+p_netcompare <- (p_gcd + p_jacc) +
+  patchwork::plot_layout(widths = c(1, 1.6)) +
+  patchwork::plot_annotation(tag_levels = "A")
+print(p_netcompare)
+ggsave("results/netcompare_gcd_jaccard_plot.png", p_netcompare,
+       width = 10, height = 4, dpi = 300)
+ggsave("results/netcompare_gcd_jaccard_plot.svg", p_netcompare,
+       width = 10, height = 4, dpi = 600)
+
+```
+
+# 10. Environmental (abiotic) associations
+
+**(a)** Community level: Mantel test (Bray-Curtis vs. scaled Euclidean
+environmental distance). **(b)** Cyanobacteria-focused: Spearman
+correlation per Taxa entry per environmental variable, BH-FDR corrected
+across the full pre-specified family of tests (all lakes, all
+Cyanobacteria taxa, all 10 environmental variables).
+
+Relative abundance is computed by normalizing the 16S and 18S count
+matrices to **their own totals separately**, then combining -- not by
+dividing by a single combined 16S+18S total. 16S and 18S sequencing depth
+per sample are independent, arbitrary quantities (driven by primer
+efficiency / sequencing effort allocation), so a shared denominator would
+let each sample's arbitrary 16S:18S read-depth ratio contaminate every
+taxon's apparent relative abundance. This differs from Sections 5-9 above,
+where raw counts are passed directly to SpiecEasi, which performs its own
+internal normalization/CLR transform -- pre-normalizing before that step
+would double-transform the data.
+
+```{r spearman-helper}
+spearman_naomit <- function(x, y) {
+  ok <- complete.cases(x, y)
+  if (sum(ok) < 4) return(c(rho = NA_real_, p = NA_real_, n = sum(ok)))
+  ct <- suppressWarnings(cor.test(x[ok], y[ok], method = "spearman"))
+  c(rho = unname(ct$estimate), p = ct$p.value, n = sum(ok))
+}
+```
+
+```{r env-associations}
+mantel_results <- list()
+cyano_env_rows <- list()
+lake_env_store <- list()# per-lake relative abundance + raw env data, for Section 11/12
+mantel_diagnostics <- list()
+
+for (code in names(lake_results)) {
+  r <- lake_results[[code]]
+  samp_ids <- r$samples
+
+  env_lake <- meta[match(samp_ids, meta$SampleShort), env_vars_all]
+  rownames(env_lake) <- samp_ids
+
+  # Unfiltered copy of this lake's environmental data (all 10 variables,
+  # own NAs) BEFORE the Mantel-specific >20%-missing column drop below.
+  # FIXED (Rmd review, bug #1): this object is now also used by the
+  # taxon-level loop further down, not just by Sections 11/12 - see note
+  # at that loop.
+  env_lake_raw <- env_lake
+
+  # Drop environmental variables from THIS LAKE'S MANTEL TEST ONLY if
+  # missing in >20% of this lake's samples (covers variables missing
+  # entirely, e.g. Btemp/BDO for an unstratified lake, and variables with
+  # heavy partial missingness, e.g. PO4/N:P). Flagged explicitly, never
+  # dropped silently.
+  missing_frac <- sapply(env_lake, function(x) mean(is.na(x)))
+  drop_cols <- names(missing_frac)[missing_frac > 0.20]
+  if (length(drop_cols) > 0) {
+    message("Lake ", code, ": environmental variable(s) excluded from the MANTEL TEST ONLY ",
+             "(missing in >20% of samples): ",
+             paste0(drop_cols, " (", round(missing_frac[drop_cols] * 100), "% missing)",
+                    collapse = ", "))
+    env_lake <- env_lake[, setdiff(names(env_lake), drop_cols), drop = FALSE]
+  }
+
+  # --- (a) Community-level Mantel test -----------------------------------
+  rel_16 <- apply(r$m16[, paste0("16S-", samp_ids)], 2, function(x) x / sum(x))
+  rel_18 <- apply(r$m18[, paste0("18S-", samp_ids)], 2, function(x) x / sum(x))
+  rel_abund <- rbind(rel_16, rel_18)
+  colnames(rel_abund) <- samp_ids
+  bio_dist_full <- vegan::vegdist(t(rel_abund), method = "bray")
+
+  lake_env_store[[code]] <- list(rel_abund = rel_abund, env_lake_raw = env_lake_raw)
+
+  complete_idx <- complete.cases(env_lake)
+  n_dropped <- sum(!complete_idx)
+  if (n_dropped > 0) {
+    message("Lake ", code, ": Mantel test uses ", sum(complete_idx), " of ",
+            nrow(env_lake), " samples (", n_dropped,
+            " excluded due to missing environmental data for THIS TEST ONLY)")
+  }
+
+  env_dist    <- dist(scale(env_lake[complete_idx, , drop = FALSE]))
+  bio_dist_sub <- as.dist(as.matrix(bio_dist_full)[complete_idx, complete_idx])
+
+  mantel_results[[code]] <- vegan::mantel(bio_dist_sub, env_dist, method = "spearman", permutations = 999)
+  # Store per-lake Mantel-test diagnostics (sample size and environmental-
+  # variable set actually used) alongside the mantel object itself, since
+  # these aren't part of the mantel-class object's own documented fields
+  # but are needed for a complete supplemental-table record.
+  mantel_diagnostics[[code]] <- list(
+  n_used        = sum(complete_idx),
+  n_total       = nrow(env_lake_raw),
+  env_vars_used = names(env_lake),          # after the >20%-missing drop, this lake only
+  env_vars_dropped = drop_cols               # variables excluded from THIS lake's Mantel test
+    )
+  cat("\nLake", code, "- Mantel test (community structure vs. environment):\n")
+  print(mantel_results[[code]])
+
+  # --- (b) Cyanobacteria taxon x environmental variable correlations -----
+  cyano_in_lake <- intersect(cyano_taxa, rownames(r$m16))
+  if (length(cyano_in_lake) == 0) {
+    message("Lake ", code, ": no Cyanobacteria taxa passed the prevalence filter - ",
+            "skipping taxon-level correlation for this lake")
+    next
+  }
+
+  cyano_rel <- rel_abund[cyano_in_lake, , drop = FALSE]
+
+  # FIXED (Rmd review, bug #1): loop over env_lake_raw (the FULL
+  # pre-specified 10-variable set for this lake), NOT env_lake (which had
+  # columns dropped above for the Mantel test specifically). The original
+  # script's own comment said taxon-level tests were "unaffected" by the
+  # Mantel-test column drop; the code did not match that comment. Using
+  # env_lake_raw here makes the code match the comment and keeps the tested
+  # family of taxon x variable pairs the full pre-specified set (Results
+  # outline Section 4.2), with missingness handled per-pair by
+  # spearman_naomit()'s complete.cases(), not by dropping the variable
+  # for every taxon in the lake.
+  for (tx in cyano_in_lake) {
+    for (v in names(env_lake_raw)) {
+      res <- spearman_naomit(cyano_rel[tx, ], env_lake_raw[[v]])
+      cyano_env_rows[[length(cyano_env_rows) + 1]] <-
+        data.frame(lake = lake_lookup[code], taxon = tx, env_var = v,
+                   rho = res["rho"], p_value = res["p"], n = res["n"])
+    }
+  }
+}
+
+# Build one row per lake from vegan::mantel() output. Field names (statistic,
+# signif, permutations, method) are exactly as documented for objects of
+# class "mantel" - https://vegandevs.github.io/vegan/reference/mantel.html
+mantel_table <- do.call(rbind, lapply(names(mantel_results), function(code) {
+  m    <- mantel_results[[code]]
+  diag <- mantel_diagnostics[[code]]
+
+  data.frame(
+    Lake                      = lake_lookup[code],
+    Correlation_method        = m$method,
+    Mantel_r                  = m$statistic,
+    p_value                   = m$signif,
+    Permutations              = m$permutations,
+    N_samples_used            = diag$n_used,
+    N_samples_total           = diag$n_total,
+    N_env_vars_used           = length(diag$env_vars_used),
+    Env_vars_used             = paste(diag$env_vars_used, collapse = "; "),
+    Env_vars_excluded_missing = if (length(diag$env_vars_dropped) > 0)
+                                   paste(diag$env_vars_dropped, collapse = "; ") else "None",
+    stringsAsFactors = FALSE,
+    row.names = NULL
+  )
+}))
+
+write.csv(mantel_table, "results/mantel_test_summary_table.csv", row.names = FALSE)
+cat("\n=== Mantel test summary table (also written to mantel_test_summary_table.csv) ===\n")
+print(mantel_table)
+
+cyano_env_table <- do.call(rbind, cyano_env_rows)
+cyano_env_table$p_adj_BH <- p.adjust(cyano_env_table$p_value, method = "BH")
+cyano_env_table$is_HAB <- cyano_env_table$taxon %in% HAB_TAXA
+cyano_env_table <- cyano_env_table[order(cyano_env_table$p_adj_BH), ]
+
+write.csv(cyano_env_table, "results/cyanobacteria_environment_correlations.csv", row.names = FALSE)
+cat("\nCyanobacteria-environment correlations (BH-FDR corrected), top results:\n")
+print(head(cyano_env_table, 15))
+cat("\n=== HAB-list genus x environment correlations only (BH-FDR corrected) ===\n")
+print(cyano_env_table[cyano_env_table$is_HAB, ])
+```
+
+# 11. HAB-focused environment correlation heatmap (per lake)
+
+Base R only (no extra plotting dependency): a taxon x environmental-variable
+grid of Spearman rho, with the BH-adjusted p-value overlaid so significance
+and effect size are both visible in one figure.
+
+```{r env-heatmap}
+# =========================================================================
+# 11 (pheatmap version). HAB genus x environmental-variable Spearman rho,
+# split by lake via gaps_col, uniform cell size via pheatmap's cellwidth/
+# cellheight - replaces the ggplot2 facet_wrap version. Same source data
+# (cyano_env_table, Section 10), same BH-adjusted significance tiers, same
+# "drop all-NA lake x env_var combos" filtering as the last revision.
+# =========================================================================
+
+required_pkgs <- c("pheatmap", "grid")
+missing_pkgs  <- required_pkgs[!vapply(required_pkgs, requireNamespace, quietly = TRUE, FUN.VALUE = logical(1))]
+if (length(missing_pkgs) > 0) stop("Missing package(s): ", paste(missing_pkgs, collapse = ", "))
+library(pheatmap); library(grid)
+
+hab_env_plot_data <- cyano_env_table[cyano_env_table$is_HAB, ]
+if (nrow(hab_env_plot_data) == 0) stop("No HAB-list genus x environment data to plot.")
+
+hab_env_plot_data$lake <- factor(hab_env_plot_data$lake, levels = lake_lookup[names(lake_lookup)])
+
+# ---- Drop (lake, env_var) combos with no non-NA rho among HAB genera in
+# that lake - same filtering step as the ggplot version ----
+combo_has_value <- with(hab_env_plot_data,
+                         tapply(rho, list(lake, env_var), function(x) any(!is.na(x))))
+combo_has_value[is.na(combo_has_value)] <- FALSE
+
+keep_idx <- mapply(function(lk, ev) isTRUE(combo_has_value[as.character(lk), ev]),
+                    hab_env_plot_data$lake, hab_env_plot_data$env_var)
+n_dropped <- sum(!keep_idx)
+if (n_dropped > 0) {
+  dropped_summary <- unique(hab_env_plot_data[!keep_idx, c("lake", "env_var")])
+  message("Section 11: dropping ", nrow(dropped_summary), " lake x env_var combination(s) ",
+          "with no non-NA rho among HAB genera:")
+  print(dropped_summary)
+}
+hab_env_plot_data <- hab_env_plot_data[keep_idx, ]
+
+sig_stars <- function(p) {
+  ifelse(is.na(p), "",
+         ifelse(p < 0.001, "***",
+                ifelse(p < 0.01, "**",
+                       ifelse(p < 0.05, "*", ""))))
+}
+
+# ---- Build column set: env_var per lake, unique matrix IDs, only the
+# combos that survived filtering above ----
+lake_order <- levels(hab_env_plot_data$lake)
+col_ids <- character(0); col_env_var <- character(0); col_lake <- character(0)
+
+for (lk in lake_order) {
+  evs <- sort(unique(hab_env_plot_data$env_var[hab_env_plot_data$lake == lk]))
+  if (length(evs) == 0) next
+  col_ids     <- c(col_ids, paste0(evs, "__", lk))
+  col_env_var <- c(col_env_var, evs)
+  col_lake    <- c(col_lake, rep(lk, length(evs)))
+}
+
+# ---- Row set: union of HAB genera across all lakes (alphabetical) ----
+all_taxa <- sort(unique(hab_env_plot_data$taxon))
+
+# ---- Build matrices: rho values, and rho+stars text for display_numbers ----
+rho_mat  <- matrix(NA_real_, nrow = length(all_taxa), ncol = length(col_ids),
+                    dimnames = list(all_taxa, col_ids))
+star_mat <- matrix("", nrow = length(all_taxa), ncol = length(col_ids),
+                    dimnames = list(all_taxa, col_ids))
+
+for (i in seq_len(nrow(hab_env_plot_data))) {
+  row <- hab_env_plot_data[i, ]
+  cid <- paste0(row$env_var, "__", as.character(row$lake))
+  if (!(cid %in% col_ids)) next   # filtered-out combo
+  if (is.na(row$rho)) next        # this specific taxon has no value even though the column survived
+  rho_mat[row$taxon, cid]  <- row$rho
+  star_mat[row$taxon, cid] <- sprintf("%.2f%s", row$rho, sig_stars(row$p_adj_BH))
+}
+
+# ---- gaps_col by lake ----
+lake_col_counts <- table(factor(col_lake, levels = lake_order))
+gap_col_positions <- cumsum(lake_col_counts)
+gap_col_positions <- gap_col_positions[-length(gap_col_positions)]
+
+col_ann <- data.frame(Lake = col_lake, row.names = col_ids)
+LAKE_COLORS <- setNames(c("#3498DB", "#E69F00", "#999999")[seq_along(lake_order)], lake_order)
+ann_colors <- list(Lake = LAKE_COLORS)
+
+# ---- Fixed color scale at [-1, 1] (rho's natural bounds), matching the
+# ggplot version's scale_fill_gradient2(limits = c(-1, 1)) rather than a
+# data-driven max - keeps cross-panel comparison meaningful ----
+breaks_seq  <- seq(-1, 1, length.out = 101)
+heat_colors <- colorRampPalette(c("#0072B2", "white", "#D55E00"))(100)
+
+CELLWIDTH_PT <- 18; CELLHEIGHT_PT <- 18
+
+hp <- pheatmap(rho_mat,
+                color = heat_colors, breaks = breaks_seq, na_col = "grey85",
+                cluster_rows = FALSE, cluster_cols = FALSE,
+                gaps_col = as.integer(gap_col_positions),
+                cellwidth = CELLWIDTH_PT, cellheight = CELLHEIGHT_PT,
+                labels_col = col_env_var,
+                annotation_col = col_ann, annotation_colors = ann_colors,
+                display_numbers = star_mat, number_color = "black",
+                fontsize_number = 7,
+                fontsize_row = 10, fontsize_col = 10, angle_col = 45,
+                main = "HAB-list genus x environmental variable (Spearman rho, BH-adjusted)",
+                silent = TRUE)
+
+required_width_in  <- grid::convertWidth(sum(hp$gtable$widths),  "in", valueOnly = TRUE)
+required_height_in <- grid::convertHeight(sum(hp$gtable$heights), "in", valueOnly = TRUE)
+cat("Measured gtable size:", round(required_width_in, 2), "in x", round(required_height_in, 2), "in\n")
+
+grid.newpage()
+grid.draw(hp$gtable)
+
+svg("results/HAB_environment_correlation_heatmap_pheatmap.svg",
+    width = required_width_in, height = required_height_in)
+grid.draw(hp$gtable)
+dev.off()
+
+cat("\nCells show Spearman rho (text) with BH-adjusted significance tiers:\n")
+cat("'*' p_adj_BH < 0.05, '**' p_adj_BH < 0.01, '***' p_adj_BH < 0.001.\n")
+cat("Grey cells = no correlation available for that taxon in that lake ",
+    "(taxon absent, or excluded by prevalence filtering) - not zero or non-significant.\n")
+```
+
+# 12. Taxon-specific relative-abundance vs. environmental-variable plots
+
+For inspecting one flagged correlation directly rather than relying on the
+heatmap alone. Works for any taxon in a lake's stored relative-abundance
+matrix. Rho/p values are pulled directly from `cyano_env_table` (already
+computed in Section 10) rather than recomputed, so the plot always matches
+what was tested/reported.
+
+```{r taxon-vs-env-function}
+plot_taxon_vs_env <- function(lake_code, taxon, env_var, corr_table = cyano_env_table) {
+  dat <- lake_env_store[[lake_code]]
+  if (is.null(dat)) {
+    stop("No stored data for lake code '", lake_code, "'. Valid codes: ",
+         paste(names(lake_env_store), collapse = ", "))
+  }
+  if (!(taxon %in% rownames(dat$rel_abund))) {
+    stop("Taxon '", taxon, "' not found in lake '", lake_code, "'s relative-abundance ",
+         "matrix - either absent from raw data, or removed by the ", min_prevalence * 100,
+         "% prevalence filter (check that lake's console output above).")
+  }
+  if (!(env_var %in% names(dat$env_lake_raw))) {
+    stop("Environmental variable '", env_var, "' not recognized. Available: ",
+         paste(names(dat$env_lake_raw), collapse = ", "))
+  }
+
+  x <- dat$env_lake_raw[[env_var]]
+  y <- dat$rel_abund[taxon, ] * 100
+  ok <- complete.cases(x, y)
+  n_dropped <- sum(!ok)
+  if (n_dropped > 0) {
+    message(lake_code, " - ", taxon, " vs ", env_var, ": ", n_dropped,
+            " sample(s) excluded from this plot (missing ", env_var, " data)")
+  }
+
+  plot_df <- data.frame(x = x[ok], y = y[ok])
+
+  p <- ggplot(plot_df, aes(x = x, y = y)) +
+    geom_point(color = COL_CYANO, size = 2.6) +
+    labs(x = env_var, y = paste0(taxon, " relative abundance (%)"),
+         title = paste0(lake_lookup[lake_code], ": ", taxon, " vs. ", env_var)) +
+    theme_minimal(base_size = 10) +
+    theme(plot.title = element_text(size = 9))
+
+  if (sum(ok) >= 3) {
+    p <- p + geom_smooth(method = "lm", formula = y ~ x, se = FALSE,
+                          color = COL_16S_OTHER, linewidth = 0.8)
+  }
+
+  stat_row <- corr_table[corr_table$lake == lake_lookup[lake_code] &
+                            corr_table$taxon == taxon & corr_table$env_var == env_var, ]
+  if (nrow(stat_row) == 1) {
+    stat_label <- sprintf("Spearman rho = %.2f\nBH-adj p = %.3f (n=%d)",
+                           stat_row$rho, stat_row$p_adj_BH, stat_row$n)
+    p <- p + annotate("text", x = -Inf, y = Inf, label = stat_label,
+                       hjust = -0.05, vjust = 1.2, size = 2.8)
+  } else {
+    message("Note: no matching row for ", taxon, " x ", env_var, " in ", lake_code,
+            " - statistic not annotated on plot.")
+  }
+
+  # ADDED: OLS annotation, merged directly into this function (previously
+  # pasted as a disconnected top-level fragment in a separate chunk, where
+  # lake_code/taxon/env_var didn't exist as objects - that's what produced
+  # "object 'lake_code' not found"). fit_taxon_env_lm() must be defined
+  # before this function is called - see the chunk below.
+  lm_result <- fit_taxon_env_lm(lake_code, taxon, env_var)
+  if (!is.null(lm_result)) {
+    lm_label <- sprintf("OLS: R\u00b2 = %.2f, p = %.3f (n=%d)",
+                         lm_result$r_squared, lm_result$p_value, lm_result$n)
+    p <- p + annotate("text", x = -Inf, y = Inf, label = lm_label,
+                       hjust = -0.05, vjust = 3.0, size = 2.8, color = "gray30")
+  }
+
+  p
+}
+```
+
+```{r taxon-vs-env-render}
+# Example plots - swap taxon/env_var/lake arguments for any combination
+# flagged in cyanobacteria_environment_correlations.csv
+p_taxon_env <- plot_taxon_vs_env("LR", "Planktothrix", "MC")
+ggsave("results/LR_planktovsMC.svg", p_taxon_env,
+       width = 4, height = 4, device = "svg")
+```
+
+```{r lm model}
+#' Fit an OLS linear model for one taxon x environmental-variable pair,
+#' using the SAME complete-case data as plot_taxon_vs_env() (same x, y,
+#' same missing-data handling) - not a separate/different dataset.
+#' Reported as a SEPARATE, uncorrected single test, since it was not part
+#' of the pre-specified family that Section 10's p.adjust(method = "BH")
+#' was applied across.
+fit_taxon_env_lm <- function(lake_code, taxon, env_var) {
+  dat <- lake_env_store[[lake_code]]
+  if (is.null(dat)) stop("No stored data for lake code '", lake_code, "'.")
+  if (!(taxon %in% rownames(dat$rel_abund))) {
+    stop("Taxon '", taxon, "' not found in lake '", lake_code, "'s relative-abundance matrix.")
+  }
+  if (!(env_var %in% names(dat$env_lake_raw))) {
+    stop("Environmental variable '", env_var, "' not recognized.")
+  }
+
+  x <- dat$env_lake_raw[[env_var]]
+  y <- dat$rel_abund[taxon, ] * 100
+  ok <- complete.cases(x, y)
+  n_dropped <- sum(!ok)
+  if (n_dropped > 0) {
+    message(lake_code, " - ", taxon, " vs ", env_var, " (lm): ", n_dropped,
+            " sample(s) excluded (missing ", env_var, " data)")
+  }
+  if (sum(ok) < 4) {
+    warning(lake_code, " - ", taxon, " vs ", env_var, ": fewer than 4 complete cases (n=",
+             sum(ok), ") - OLS estimates would be unreliable at this sample size. Not fitting.")
+    return(NULL)
+  }
+
+  fit <- lm(y[ok] ~ x[ok])
+  s <- summary(fit)
+
+  list(
+    n = sum(ok),
+    slope = unname(coef(fit)[2]),
+    intercept = unname(coef(fit)[1]),
+    r_squared = s$r.squared,
+    adj_r_squared = s$adj.r.squared,
+    f_statistic = unname(s$fstatistic["value"]),
+    df1 = unname(s$fstatistic["numdf"]),
+    df2 = unname(s$fstatistic["dendf"]),
+    p_value = pf(s$fstatistic["value"], s$fstatistic["numdf"], s$fstatistic["dendf"],
+                 lower.tail = FALSE),
+    model = fit
+  )
+}
+
+# Render (unchanged call, now also computes/prints the lm result)
+p_taxon_env <- plot_taxon_vs_env("LR", "Planktothrix", "MC")
+lm_check <- fit_taxon_env_lm("LR", "Planktothrix", "MC")
+cat("OLS fit, Lake Rippowam Planktothrix vs MC:\n")
+cat("  slope =", round(lm_check$slope, 3), " R-squared =", round(lm_check$r_squared, 3),
+    " p =", signif(lm_check$p_value, 3), " (n=", lm_check$n, ", NOT BH-adjusted - single test)\n")
+
+ggsave("results/LR_planktovsMC.svg", p_taxon_env, width = 4, height = 4, device = "svg")
+```
+
+# 15. Network diagnostics export
+
+```{r diagnostics-export}
+out_dir <- "results/network_diagnostics_export"
+dir.create(out_dir, showWarnings = FALSE)
+
+# Edge counts per lake
+edge_counts <- data.frame(Lake = names(lake_results),
+                           n_edges = sapply(lake_results, function(x) nrow(x$net$edgelist1)))
+write.csv(edge_counts, file.path(out_dir, "edge_counts_per_lake.csv"), row.names = FALSE)
+cat("\nEdge counts per lake:\n"); print(edge_counts)
+
+# Full edge table per lake (asso/diss/adja), unfiltered
+for (code in names(lake_results)) {
+  write.csv(lake_results[[code]]$net$edgelist1,
+            file.path(out_dir, paste0("edgelist_", code, ".csv")), row.names = FALSE)
+}
+
+# Edge-weight quantiles per lake
+sink(file.path(out_dir, "edge_weight_quantiles.txt"))
+for (code in names(lake_results)) {
+  cat("Lake:", code, "\n")
+  print(round(quantile(lake_results[[code]]$edge_w, probs = c(0, .25, .5, .75, .9, .95, 1)), 3))
+  cat("\n")
+}
+sink()
+
+# Hub taxa per lake - $hubs structure varies by NetCoMi version; check
+# before trusting the extraction, as the original script itself noted.
+cat("\nChecking $hubs structure for first lake (verify before trusting extraction):\n")
+str(lake_results[[1]]$props$hubs)
+
+hub_list <- lapply(names(lake_results), function(code) {
+  hubs <- lake_results[[code]]$props$hubs
+  hub_names <- if (!is.null(hubs$hubs1)) hubs$hubs1 else hubs   # adjust if str() above differs
+  data.frame(Lake = code, HubTaxon = hub_names)
+})
+hub_df <- do.call(rbind, hub_list)
+write.csv(hub_df, file.path(out_dir, "hub_taxa_per_lake.csv"), row.names = FALSE)
+cat("\nHub taxa per lake:\n"); print(hub_df)
+```
+
+# 16. HAB-genus edges at a data-driven 75th-percentile cutoff
+
+Threshold is recomputed from **each lake's own** `|asso|` distribution (75th
+percentile), not a fixed round number, consistent with the earlier
+diagnostic in Section 5 showing these are symmetrized MB coefficients, not
+Pearson/partial correlations with a conventional "moderate" cutoff.
+
+```{r hab-75pct}
+# FIXED (Rmd review, redundancy #3): renamed from `hab_edges_all` (which
+# collided with the Section 6 object of the same name) to
+# hab_edges_75pct_all_lakes. FIXED (redundancy #4): computed directly from
+# lake_results$net$edgelist1 in memory, not re-read from the CSVs just
+# written in Section 15.
+hab_edges_75pct_list <- lapply(names(lake_results), function(code) {
+
+  edges <- lake_results[[code]]$net$edgelist1
+  cutoff <- quantile(abs(edges$asso), probs = 0.75)
+
+  is_hab <- edges$v1 %in% HAB_TAXA | edges$v2 %in% HAB_TAXA
+  passes <- abs(edges$asso) >= cutoff
+  sub <- edges[is_hab & passes, ]
+  if (nrow(sub) == 0) return(NULL)
+
+  sub$HAB_genus <- ifelse(sub$v1 %in% HAB_TAXA, sub$v1, sub$v2)
+  sub$Partner   <- ifelse(sub$v1 %in% HAB_TAXA, sub$v2, sub$v1)
+  sub$Lake      <- code
+  sub$cutoff_used <- round(cutoff, 3)
+
+  sub[, c("Lake", "HAB_genus", "Partner", "asso", "cutoff_used")]
+})
+
+hab_edges_75pct_all_lakes <- do.call(rbind, hab_edges_75pct_list)
+hab_edges_75pct_all_lakes$asso <- round(hab_edges_75pct_all_lakes$asso, 3)
+hab_edges_75pct_all_lakes <- hab_edges_75pct_all_lakes[order(hab_edges_75pct_all_lakes$Lake,
+                                                              hab_edges_75pct_all_lakes$HAB_genus), ]
+
+write.csv(hab_edges_75pct_all_lakes, "results/hab_edges_75pct_all_lakes.csv", row.names = FALSE)
+
+cat("HAB-genus edges at 75th-percentile cutoff, by lake:\n")
+print(table(hab_edges_75pct_all_lakes$Lake))
+cat("\nCutoffs used per lake (|asso| >=):\n")
+print(tapply(hab_edges_75pct_all_lakes$cutoff_used, hab_edges_75pct_all_lakes$Lake, unique))
+```
+
+# 17. Output summary
+
+```{r summary}
+cat("\n=== Outputs written ===\n")
+cat("- 16S_removed_chloroplast_mitochondria_eukaryota.csv : audit trail, Section 2\n")
+cat("- cyanobacteria_cooccurrence_edges_by_lake.csv : biotic co-occurrence edges\n")
+cat("  involving Cyanobacteria, per lake, with partner domain and is_HAB flag\n")
+cat("- HAB_subnetwork_taxon_reference.csv : taxon lookup table, Section 7\n")
+cat("- HAB_subnetwork_<lake>.svg : HAB ego-network figure per lake, Section 7\n")
+cat("- netcompare_<lake>_vs_<lake>.txt / netcompare_all_comparisons.txt : full\n")
+cat("  netCompare() summary() text per lake pair, Section 9\n")
+cat("- netcompare_global_properties.csv, netcompare_gcd.csv, netcompare_jaccard.csv,\n")
+cat("  netcompare_gcd_jaccard_plot.png : structured exports + combined figure, Section 9\n")
+cat("- cyanobacteria_environment_correlations.csv : abiotic associations, BH-FDR\n")
+cat("  corrected, full pre-specified variable family per lake (bug #1 fix)\n")
+cat("- network_diagnostics_export/ : edge counts, full edge lists, edge-weight\n")
+cat("  quantiles, hub taxa - all per lake\n")
+cat("- hab_edges_75pct_all_lakes.csv : HAB edges above each lake's own 75th\n")
+cat("  percentile |asso| cutoff\n")
+```

@@ -1,0 +1,526 @@
+---
+title: "2023 18S Re-analyzed Diversity"
+output: html_document
+date: "2026-07-28"
+---
+
+```{r}
+#------- load packages -------#
+#Load libraries
+library("ggplot2")
+library("vegan")
+library("dplyr")
+library("scales")
+library("grid")
+library("reshape2")
+library("phyloseq")
+library("phangorn")
+library("DECIPHER")
+library("dada2")
+library("microbiome")
+library("RColorBrewer")
+library("stringr")
+library("readxl")
+library("svglite")
+library("patchwork")
+library("metagMisc")
+```
+
+```{r}
+# Ensure output directories exist (matches structure documented in README.md)
+dir.create("results", showWarnings = FALSE, recursive = TRUE)
+dir.create("figs", showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r}
+#------- import data -------#
+# NOTE: run asv_curation_18S.R first -- it produces
+# results/tax_filled_2023_18S.csv, which is what this chunk reads below.
+
+# Sequence count table (path relative to repository root)
+otutab3 <- read.csv("data/asv_otu_rl_2023_18S.csv", check.names = F)
+rownames(otutab3)<- otutab3[,1]
+otutab3 <- otutab3[,2:46]
+otutab3 <- otu_table(otutab3, taxa_are_rows = T)
+
+# Sequence taxonomy classifications -- curated (Taxa/taxa2-filled) table
+# produced by asv_curation_18S.R, NOT the raw data/asv_tax_rl_2023_18S.csv
+# (which has two fewer columns: no filled "Taxa" or "taxa2" fields).
+tax3 <- read.csv("results/tax_filled_2023_18S.csv", header=T)
+rownames(tax3)<- taxa_names(otutab3)
+tax3 <- tax3[,2:12]
+tax3 <- as.matrix(tax3)
+tax3 <- tax_table(tax3)
+taxa_names(tax3) <- taxa_names(otutab3)
+
+# Sample metadata -- data/ossining_meta.csv is the correct source; see
+# metadata_utils.R for how the "Name2" (18S sample-name key), Month, and
+# Date_Sam columns are derived from the existing SampleID/Date columns.
+source("metadata_utils.R")
+meta3 <- load_ossining_meta("data/ossining_meta.csv")
+meta3 <- meta3[meta3$Year == 2023, ]
+meta3 <- make_sample_name(meta3, domain_prefix = "18S", name_col = "Name2")
+meta3 <- sample_data(meta3)
+rownames(meta3) <- meta3$Name2
+# Load table, tax, and metadata into phyloseq object
+physeq_18S23 <- merge_phyloseq(otutab3, tax3, meta3)
+
+# remove samples with zero counts
+physeq_18S23 <- prune_samples(sample_sums(physeq_18S23) >= 1, physeq_18S23)
+
+# remove chloroplasts
+#physeq_18S23 <- subset_taxa(physeq_18S23, Order!="Chloroplast")
+```
+
+```{r}
+#------- alpha diversity measures -------#
+library("microbiome")
+library("knitr")
+alpha18S23 <- microbiome::alpha(physeq_18S23)
+write.csv(alpha18S23, "results/ossining23-18S_alpha-diversity-2.csv")
+
+#------- plot richness -------#
+jpeg("figs/richplot18S_23-2.jpg",width = 10, height =8, units = "in", res = 300)
+plot_richness(physeq_18S23, x = "Date_Sam", measures="Observed") +
+  geom_boxplot() +
+  theme_bw() + theme(axis.text.x=element_text(angle=60, hjust=1)) + 
+  theme(axis.text = element_text(size = 14))+
+  theme(axis.title.x=element_blank())
+
+jpeg("figs/richplot18S_23_lake-2.jpg",width = 10, height =8, units = "in", res = 300)
+plot_richness(physeq_18S23, x = "Date_Sam", measures="Observed", title = "18S 2023 richness") +
+  geom_boxplot() +
+  theme_bw() + theme(axis.text.x=element_text(angle=60, hjust=1)) + 
+  theme(axis.text = element_text(size = 14))+
+  theme(axis.title.x=element_blank()) +facet_grid(.~Lake, scales="free")
+
+rich.plot18S <- plot_richness(physeq_18S23, x = "Date_Sam", measures="Observed") +
+  geom_boxplot() +
+  theme_bw() + theme(axis.text.x=element_text(angle=60, hjust=1)) + 
+  theme(axis.text = element_text(size = 14))+
+  theme(axis.title.x=element_blank())
+
+#------- Division bar plot -------#
+p_18S23 <- subset_taxa(physeq_18S23) %>%
+  tax_glom(taxrank = "Taxa2") %>%                     #agglomerate to edited division level
+  transform_sample_counts(function(x){x/sum(x)}) %>%   #transform to relative abundance
+  psmelt()
+write.csv(p_18S23, "results/ossining23-18S_division-2.csv")
+
+library(dplyr)
+relabund_table_18S2023Division <- p_18S23 %>%
+  group_by(Lake, Month, Date_Sam, Taxa2) %>%
+  summarize(RelAbund = sum(Abundance), .groups = "drop")
+
+write.csv(relabund_table_18S2023Division,
+          "results/ossining23-18S_relative_abundance_division-2.csv",
+          row.names = FALSE)
+
+colourCount = length(unique(p_18S23$Taxa2))
+getPalette = colorRampPalette(brewer.pal(12, "Paired"))
+
+phyplot_18S23 <- ggplot(arrange(p_18S23, Taxa2), aes(x=Date_Sam, y=Abundance, fill=Taxa2)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        plot.title = element_text(size=10, hjust = 0.5), 
+        legend.text=element_text(size=10)) +
+  ylab("Relative Read Abundance") +
+  theme(axis.text = element_text(size = 10))+
+  scale_fill_manual(values = getPalette(colourCount)) +
+  scale_y_continuous(limits = c(0,1), expand = c(0,0))+
+  guides(fill=guide_legend(ncol = 2))+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+phyplot_18S23 +facet_grid(.~Lake, scales="free")+
+  theme(strip.text.x = element_text(size = 9))
+
+#SAVE PLOTS:
+jpeg("figs/divplot18S-2.jpg",width = 12, height =8, units = "in", res = 300)
+ggplot(arrange(p_18S23, Taxa2), aes(x=Date_Sam, y=Abundance, fill=Taxa2)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        plot.title = element_text(size=10, hjust = 0.5), 
+        legend.text=element_text(size=10)) +
+  ylab("Relative Read Abundance") +
+  theme(axis.text = element_text(size = 10))+
+  scale_fill_manual(values = getPalette(colourCount)) +
+  scale_y_continuous(limits = c(0,1), expand = c(0,0))+
+  guides(fill=guide_legend(ncol = 2))+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+jpeg("figs/lake_divplot18S-2.jpg",width = 14, height =8, units = "in", res = 300)
+phyplot_18S23 +facet_grid(.~Lake, scales="free")+
+  theme(strip.text.x = element_text(size = 9)) + plot_annotation ("18S 2023 Relative Read Abundance")
+
+#save as svg
+ggsave("figs/lake_divplot18S_22-2.svg",width = 14, height =8, units = "in")
+phyplot_18S23 +facet_grid(.~Lake, scales="free")+
+  theme(strip.text.x = element_text(size = 9)) + plot_annotation ("18S 2023 Relative Read Abundance")
+```
+
+```{r}
+#------- Chytrid bar plot -------#
+chytrid_18S23 <- subset_taxa(physeq_18S23, Class=="Chytridiomycota") %>%
+  tax_glom(taxrank = "Order") %>%                     #agglomerate to order level
+  transform_sample_counts(function(x){x/sum(x)}) %>%   #transform to relative abundance
+  psmelt()%>%                                         # melt to long format
+  filter(Abundance > 0.01) 
+write.csv(chytrid_18S23, "results/ossining23-18S_chytrid-2.csv")
+
+#library(dplyr)
+relabund_table_18S2023Chytrid <- chytrid_18S23 %>%
+  group_by(Lake, Month, Date_Sam, Order) %>%
+  summarize(RelAbund = sum(Abundance), .groups = "drop")
+
+write.csv(relabund_table_18S2023Chytrid,
+          "results/ossining23-18S_relative_abundance_chytrid-2.csv",
+          row.names = FALSE)
+
+colourCount = length(unique(chytrid_18S23$Order))
+getPalette = colorRampPalette(brewer.pal(8, "Set1"))
+
+chytrid_plot_18S23 <- ggplot(arrange(chytrid_18S23, Order), aes(x=Date_Sam, y=Abundance, fill=Order)) +
+  geom_bar(stat = "identity") + theme_bw() +
+  theme(plot.title = element_text(size=10, hjust = 0.5), 
+        axis.title.x = element_blank(),
+        legend.text=element_text(size=10),
+        legend.position = "right") +
+  theme(axis.text = element_text(size = 10))+
+  ylab("Relative Read Abundance") +
+  scale_fill_manual(values = getPalette(colourCount)) +
+  scale_y_continuous(limits = c(0,1.001), expand = c(0,0))+
+  guides(fill=guide_legend(ncol = 1))+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+chytrid_plot_18S23 +facet_grid(.~Lake, scales="free")+
+  theme(strip.text.x = element_text(size = 9))
+
+#save as jpeg
+jpeg("figs/chytridplot18S23-2.jpg",width = 10, height =8, units = "in", res = 300)
+ggplot(arrange(chytrid_18S23, Order), aes(x=Date_Sam, y=Abundance, fill=Order)) +
+  geom_bar(stat = "identity") + theme_bw() +
+  theme(plot.title = element_text(size=10, hjust = 0.5), 
+        axis.title.x = element_blank(),
+        legend.text=element_text(size=10),
+        legend.position = "right") +
+  theme(axis.text = element_text(size = 10))+
+  ylab("Relative Read Abundance") +
+  scale_fill_manual(values = getPalette(colourCount)) +
+  scale_y_continuous(limits = c(0,1.001), expand = c(0,0))+
+  guides(fill=guide_legend(ncol = 1))+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+jpeg("figs/lake_chytridplot18S23-2.jpg",width = 12, height =8, units = "in", res = 300)
+chytrid_plot_18S23 +facet_grid(.~Lake, scales="free")+
+  theme(strip.text.x = element_text(size = 9)) + plot_annotation ("18S 2023 Chytrid Relative Read Abundance")
+
+#save as svg to edit colors
+ggsave("figs/lake_chytridplot18S_23-2.svg",width = 12, height =8, units = "in")
+chytrid_plot_18S23 +facet_grid(.~Lake, scales="free")+
+  theme(strip.text.x = element_text(size = 9)) + plot_annotation ("18S 2023 Chytrid Relative Read Abundance")
+dev.off()
+```
+
+```{r}
+#------- Metazoa bar plot -------#
+metazoa_18S23 <- subset_taxa(physeq_18S23, Subdivision=="Metazoa") %>%
+  tax_glom(taxrank = "Genus") %>%                     #agglomerate to genus level
+  transform_sample_counts(function(x){x/sum(x)}) %>%   #transform to relative abundance
+  psmelt()                                         # melt to long format
+  #%>%filter(Abundance > 0.01) 
+write.csv(metazoa_18S23, "results/ossining23-18S_metazoa-2.csv")
+
+#library(dplyr)
+relabund_table_18S2023Metazoa <- metazoa_18S23 %>%
+  group_by(Lake, Month, Date_Sam, Genus) %>%
+  summarize(RelAbund = sum(Abundance), .groups = "drop")
+
+write.csv(relabund_table_18S2023Metazoa,
+          "results/ossining23-18S_relative_abundance_metazoa-2.csv",
+          row.names = FALSE)
+
+colourCount = length(unique(metazoa_18S23$Genus))
+getPalette = colorRampPalette(brewer.pal(8, "Set1"))
+
+metazoa_plot_18S23 <- ggplot(arrange(metazoa_18S23, Genus), aes(x=Date_Sam, y=Abundance, fill=Genus)) +
+  geom_bar(stat = "identity") + theme_bw() +
+  theme(plot.title = element_text(size=10, hjust = 0.5), 
+        axis.title.x = element_blank(),
+        legend.text=element_text(size=10),
+        legend.position = "right") +
+  theme(axis.text = element_text(size = 10))+
+  ylab("Relative Read Abundance") +
+  scale_fill_manual(values = getPalette(colourCount)) +
+  scale_y_continuous(limits = c(0,1.001), expand = c(0,0))+
+  guides(fill=guide_legend(ncol = 2))+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+metazoa_plot_18S23 +facet_grid(.~Lake, scales="free")+
+  theme(strip.text.x = element_text(size = 9))
+
+#save as jpeg
+jpeg("figs/metazoaplot18S23-2.jpg",width = 10, height =8, units = "in", res = 300)
+ggplot(arrange(metazoa_18S23, Genus), aes(x=Date_Sam, y=Abundance, fill=Genus)) +
+  geom_bar(stat = "identity") + theme_bw() +
+  theme(plot.title = element_text(size=10, hjust = 0.5), 
+        axis.title.x = element_blank(),
+        legend.text=element_text(size=10),
+        legend.position = "right") +
+  theme(axis.text = element_text(size = 10))+
+  ylab("Relative Read Abundance") +
+  scale_fill_manual(values = getPalette(colourCount)) +
+  scale_y_continuous(limits = c(0,1.001), expand = c(0,0))+
+  guides(fill=guide_legend(ncol = 1))+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+jpeg("figs/lake_metazoaplot18S23-2.jpg",width = 13, height =10, units = "in", res = 300)
+metazoa_plot_18S23 +facet_grid(.~Lake, scales="free")+
+theme(strip.text.x = element_text(size = 9)) + plot_annotation ("18S 2023 Metazoa Relative Read Abundance")
+
+#save as svg to edit colors
+ggsave("figs/lake_metazoaplot18S_23-2.svg",width = 13, height =10, units = "in")
+metazoa_plot_18S23 +facet_grid(.~Lake, scales="free")+
+  theme(strip.text.x = element_text(size = 9)) + plot_annotation ("18S 2023 Metazoa Relative Read Abundance")
+dev.off
+```
+
+
+```{r}
+
+#------- PCoA  -------#
+#subset by lake
+LM_18S23 <- subset_samples(physeq_18S23, Lake =="Lake Mohegan")
+LM_18S23
+#phyloseq-class experiment-level object
+#otu_table()   OTU Table:         [ 3283 taxa and 15 samples ]
+#sample_data() Sample Data:       [ 15 samples by 13 sample variables ]
+#tax_table()   Taxonomy Table:    [ 3283 taxa by 11 taxonomic ranks ]
+
+#scale to even depth
+LM_18S23rare <- rarefy_even_depth(LM_18S23)
+LM_18S23rare
+#phyloseq-class experiment-level object
+#otu_table()   OTU Table:         [ 790 taxa and 15 samples ]
+#sample_data() Sample Data:       [ 15 samples by 13 sample variables ]
+#tax_table()   Taxonomy Table:    [ 790 taxa by 11 taxonomic ranks ]
+sample_sums(LM_18S23rare) #21728
+
+#PCoA of Mohegan Lake
+pcoa_LM_18S23 <- ordinate(physeq=LM_18S23rare, method = "PCoA", distance = "bray")
+
+jpeg("figs/LM_pcoa_plot18S_23-2.jpg",width = 10, height =8, units = "in", res = 300)
+plot_scree(pcoa_LM_18S23) 
+
+ord_LM_18S23 <- plot_ordination(physeq=LM_18S23rare, ordination = pcoa_LM_18S23, color = "Month", 
+                title = "Lake Mohegan") +
+  geom_point(aes(color = Month), alpha = 0.75, size = 4)+
+  theme_bw()+
+  theme(text = element_text(size = 14))+
+  guides(color = guide_legend(title = "Month", ncol = 1))
+
+##rippowam lake
+#subset by lake
+LR_18S23 <- subset_samples(physeq_18S23, Lake =="Lake Rippowam")
+LR_18S23
+#phyloseq-class experiment-level object
+#otu_table()   OTU Table:         [ 3283 taxa and 15 samples ]
+#sample_data() Sample Data:       [ 15 samples by 13 sample variables ]
+#tax_table()   Taxonomy Table:    [ 3283 taxa by 11 taxonomic ranks ]
+
+#scale to even depth
+LR_18S23rare <- rarefy_even_depth(LR_18S23)
+LR_18S23rare
+#phyloseq-class experiment-level object
+#otu_table()   OTU Table:         [ 1763 taxa and 15 samples ]
+#sample_data() Sample Data:       [ 15 samples by 13 sample variables ]
+#tax_table()   Taxonomy Table:    [ 1763 taxa by 11 taxonomic ranks ]
+sample_sums(LR_18S23rare) #44814
+
+#PCoA of Rippowam Lake
+pcoa_LR_18S23 <- ordinate(physeq=LR_18S23rare, method = "PCoA", distance = "bray")
+
+jpeg("figs/LR_pcoa_plot18S_23-2.jpg",width = 10, height =8, units = "in", res = 300)
+plot_scree(pcoa_LR_18S23) 
+
+ord_LR_18S23 <- plot_ordination(physeq=LR_18S23rare, ordination = pcoa_LR_18S23, color = "Month", 
+                title = "Lake Rippowam") +
+  geom_point(aes(color = Month), alpha = 0.75, size = 4)+
+  theme_bw()+
+  theme(text = element_text(size = 14))+
+  guides(color = guide_legend(title = "Month", ncol = 1))
+
+###Teatown Lake
+#subset by lake
+TTL_18S23 <- subset_samples(physeq_18S23, Lake =="Teatown Lake")
+TTL_18S23
+#phyloseq-class experiment-level object
+#otu_table()   OTU Table:         [ 3283 taxa and 15 samples ]
+#sample_data() Sample Data:       [ 15 samples by 13 sample variables ]
+#tax_table()   Taxonomy Table:    [ 3283 taxa by 11 taxonomic ranks ]
+
+#scale to even depth
+TTL_18S23rare <- rarefy_even_depth(TTL_18S23)
+TTL_18S23rare
+#phyloseq-class experiment-level object
+#otu_table()   OTU Table:         [ 774 taxa and 15 samples ]
+#sample_data() Sample Data:       [ 15 samples by 13 sample variables ]
+#tax_table()   Taxonomy Table:    [ 774 taxa by 11 taxonomic ranks ]
+sample_sums(TTL_18S23rare) #6964
+
+#PCoA of Rippowan Lake
+pcoa_TTL_18S23 <- ordinate(physeq=TTL_18S23rare, method = "PCoA", distance = "bray")
+
+jpeg("figs/TTL_pcoa_plot18S_23-2.jpg",width = 10, height =8, units = "in", res = 300)
+plot_scree(pcoa_LR_18S23) 
+
+ord_TTL_18S23 <- plot_ordination(physeq=TTL_18S23rare, ordination = pcoa_TTL_18S23, color = "Month", title = "Teatown Lake") +
+  geom_point(aes(color = Month), alpha = 0.75, size = 4)+
+  theme_bw()+
+  theme(text = element_text(size = 14))+
+  guides(color = guide_legend(title = "Month", ncol = 1))
+
+#PATCHWORK FOR LAKE
+jpeg("figs/ordination_pcoa_plot18S_23-2.jpg",width = 10, height =8, units = "in", res = 300)
+ord_LM_18S23 / ord_LR_18S23 / ord_TTL_18S23 + plot_annotation ("PCoA of 18S 2023 Data")
+
+ggsave("figs/ordination_pcoa_plot18S_23.svg",width = 10, height =8, units = "in")
+ord_LM_18S23 / ord_LR_18S23 / ord_TTL_18S23 + plot_annotation ("PCoA of 18S 2023 Data")
+
+#save jpeg each individual lake if needed EX:
+##jpeg("figs/LM_ordination_pcoa_plot18S_22.jpg",width = 10, height =8, units = "in", res = 300)
+##plot_ordination(physeq=LM_18S22rare, ordination = pcoa_LM_18S22, color = "Month",  title = "PCoA of LM 18S Data 2022") + geom_point(aes(color = Month), alpha = 0.75, size = 4)+ theme_bw()+ theme(text = element_text(size = 14))+ guides(color = guide_legend(title = "Month", ncol = 1))
+
+```
+
+```{r}
+#------PERMANOVA--------#
+#FOR MOHEGAN
+#bray curtis on rarified physeq
+LMbray18S23 <- phyloseq::distance(LM_18S23rare, method="bray")
+#make physeq a data frame
+LMdf18S23 <- data.frame(sample_data(LM_18S23rare))
+#PERMANOVA with bray curtis in formula and data as dataframe
+LMperm18S23 <- adonis2(LMbray18S23~Month, data=LMdf18S23)
+#check output
+LMperm18S23
+#NOT significant
+
+#FOR RIPPOWAM
+#bray curtis on rarified physeq
+LRbray18S23 <- phyloseq::distance(LR_18S23rare, method="bray")
+#make physeq a data frame
+LRdf18S23 <- data.frame(sample_data(LR_18S23rare))
+#PERMANOVA with bray curtis in formula and data as dataframe
+LRperm18S23 <- adonis2(LRbray18S23~Month, data=LRdf18S23)
+#check output
+LRperm18S23
+#significant!
+
+#FOR TEATOWN
+#bray curtis on rarified physeq
+TTLbray18S23 <- phyloseq::distance(TTL_18S23rare, method="bray")
+#make physeq a data frame
+TTLdf18S23 <- data.frame(sample_data(TTL_18S23rare))
+#PERMANOVA with bray curtis in formula and data as dataframe
+TTLperm18S23 <- adonis2(TTLbray18S23~Month, data=TTLdf18S23)
+#check output
+TTLperm18S23
+#significant!
+
+#ALL LAKES: physeq_18S23
+#scale to even depth
+Lake23rare18 <- rarefy_even_depth(physeq_18S23)
+Lake23rare18
+#phyloseq-class experiment-level object
+#otu_table()   OTU Table:         [ 2469 taxa and 45 samples ]
+#sample_data() Sample Data:       [ 45 samples by 13 sample variables ]
+#tax_table()   Taxonomy Table:    [ 2469 taxa by 11 taxonomic ranks ]
+sample_sums(Lake23rare18) #6964
+
+#bray curtis on rarified physeq
+Lake23bray18 <- phyloseq::distance(Lake23rare18, method="bray")
+#make physeq a data frame
+Lake23df18 <- data.frame(sample_data(Lake23rare18))
+#PERMANOVA with bray curtis in formula and data as dataframe
+Lake23perm18 <- adonis2(Lake23bray18~Lake*Month, data=Lake23df18, by="terms")
+#check output
+Lake23perm18
+#All combinations significant!
+```
+
+```{r}
+#PAIRWISE TESTING FOLLOWING PERMANOVA
+
+#LR,TTL significant -> pairwise comparison post hoc
+
+LRdf18S23$Month=as.factor(LRdf18S23$Month)
+LRpairwise18S23 <- adonis_pairwise(x=LRdf18S23, dd=LRbray18S23, group.var="Month")
+LRpairwise18S23
+#Aug/June, Aug/Sept, July/June, July/Sept, June/Sept significant -> not Aug/July
+
+TTLdf18S23$Month=as.factor(TTLdf18S23$Month)
+TTLpairwise18S23 <- adonis_pairwise(x=TTLdf18S23, dd=TTLbray18S23, group.var="Month")
+TTLpairwise18S23
+#Aug/July significant -> not Aug/June, Aug/Sept, July/June, June/Sept, July/Sept
+
+#All lake significant lake*month (all 3 interactions) -> pairwise comparison post hoc
+
+Lake23df18$Month=as.factor(Lake23df18$Month)
+Lake23df18$Lake=as.factor(Lake23df18$Lake)
+Lake23pairwise18 <- adonis_pairwise(x=Lake23df18, dd=Lake23bray18, group.var="Lake")
+Lake23pairwise18
+#LM/LR, LR/TTL significant
+Month23pairwise18 <- adonis_pairwise(x=Lake23df18, dd=Lake23bray18, group.var="Month")
+Month23pairwise18
+# June/sept, july/sept significant -> not aug/july, aug/june, aug/sep, july/june
+```
+
+
+```{r}
+#------HOMOGENEITY OF MULTIVARIATE DISPERSION (PERMDISP)------#
+# Run this BEFORE trusting each PERMANOVA result above
+# if significant, run TukeyHSD
+
+#FOR MOHEGAN
+LMdisp18S23 <- betadisper(LMbray18S23, LMdf18S23$Month)
+permutest(LMdisp18S23, permutations = 999)
+#not significant
+
+#FOR RIPPOWAM
+LRdisp18S23 <- betadisper(LRbray18S23, LRdf18S23$Month)
+permutest(LRdisp18S23, permutations = 999)
+#not significant
+
+#FOR TEATOWN
+TTLdisp18S23 <- betadisper(TTLbray18S23, TTLdf18S23$Month)
+permutest(TTLdisp18S23, permutations = 999)
+# SIGNIFICANT
+TukeyHSD(TTLdisp18S23)
+# all but Sept-Aug and June-July significant
+
+#ALL LAKES: physeq_18S23
+#Lake23perm18 used Lake*Month, so check dispersion for EACH factor separately
+#betadisper only takes one grouping factor at a time
+
+#dispersion by Lake
+Lake23disp_Lake <- betadisper(Lake23bray18, Lake23df18$Lake)
+permutest(Lake23disp_Lake, permutations = 999)
+#SIGNIFICANT
+TukeyHSD(Lake23disp_Lake)
+#TTL/LR significant
+
+#dispersion by Month
+Lake23disp_Month <- betadisper(Lake23bray18, Lake23df18$Month)
+permutest(Lake23disp_Month, permutations = 999)
+#not significant
+
+#dispersion by the Lake:Month interaction (combine factors into one grouping variable)
+Lake23df18$LakeMonth <- interaction(Lake23df18$Lake, Lake23df18$Month)
+Lake23disp_LakeMonth <- betadisper(Lake23bray18, Lake23df18$LakeMonth)
+permutest(Lake23disp_LakeMonth, permutations = 999)
+#SIGNIFICANT
+TukeyHSD(Lake23disp_LakeMonth)$group[, "p adj"]
+#none were significant
+```
